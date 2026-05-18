@@ -32,7 +32,25 @@ add_shortcode( 'avada_property_epcs', function( $atts ) {
 
             foreach ($epc_urls as $epc)
             {
-                echo '<a href="' . esc_url($epc['url']) . '" data-fancybox="epcs" rel="nofollow"><img src="' . esc_url($epc['url']) . '" alt=""></a>';
+                $url = esc_url($epc['url']);
+				$ext = strtolower(pathinfo(parse_url($url, PHP_URL_PATH), PATHINFO_EXTENSION));
+
+				if ($ext === 'pdf') {
+
+					echo '<a href="' . $url . '" 
+							target="_blank"
+							rel="nofollow">
+							View EPC
+						  </a><br>';
+
+				} else {
+
+					echo '<a href="' . $url . '" 
+							data-fancybox="epcs"
+							rel="nofollow">
+							<img src="' . $url . '" alt="">
+						  </a>';
+				}
             }
 
             echo '</div>';
