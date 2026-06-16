@@ -432,7 +432,7 @@ class PH_Elementor {
 
         if ( isset($settings['show_flag']) && $settings['show_flag'] == 'yes' )
         {
-            $flag = propertyhive_get_flag();
+            $flag = $this->get_flag();
 
             if ( $flag != '' )
             {
