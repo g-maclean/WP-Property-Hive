@@ -17,3 +17,4 @@
 .gitattributes export-ignore
 .gitignore export-ignore
 .wp-env.json export-ignore
+propertyhive-osm-location-checker export-ignore

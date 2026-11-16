@@ -1,0 +1,29 @@
+.phosm-wrap .phosm-card { background: #fff; border: 1px solid #c3c4c7; padding: 4px 20px 20px; margin: 20px 0; max-width: 1400px; }
+.phosm-inline-form { display: inline-block; margin: 0 6px 6px 0; }
+.phosm-controls label { margin-right: 12px; }
+.phosm-controls, .phosm-maintenance { margin: 12px 0; }
+.phosm-progress-bar { height: 14px; background: #f0f0f1; border-radius: 7px; overflow: hidden; margin-top: 12px; }
+.phosm-progress-bar span { display: block; height: 100%; background: #2271b1; transition: width .3s; }
+.phosm-live-log { max-height: 280px; overflow: auto; margin: 8px 0 0; padding: 8px 8px 8px 12px; list-style: none; background: #f6f7f7; font: 12px/1.6 Menlo, Consolas, monospace; }
+.phosm-live-log li { margin: 0; }
+.phosm-live-match { color: #00712e; }
+.phosm-live-mismatch, .phosm-live-error { color: #b32d2e; }
+.phosm-live-warning, .phosm-live-no_osm_data, .phosm-live-no_term { color: #996800; }
+.phosm-headline { display: flex; flex-wrap: wrap; gap: 16px; margin: 12px 0; }
+.phosm-headline > div { flex: 1 1 200px; background: #f6f7f7; padding: 14px; border-radius: 4px; }
+.phosm-big { display: block; font-size: 28px; font-weight: 600; line-height: 1.2; margin-bottom: 4px; }
+.phosm-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 24px; }
+.phosm-wrap .num { text-align: right; white-space: nowrap; }
+.phosm-primary td:first-child code { font-weight: 600; }
+.phosm-badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; background: #dcdcde; color: #1d2327; white-space: nowrap; }
+.phosm-match { background: #d1f0dc; color: #00451c; }
+.phosm-partial, .phosm-broader, .phosm-narrower { background: #dbe9f6; color: #0a3d6b; }
+.phosm-mismatch, .phosm-error { background: #f8d7d7; color: #6e1414; }
+.phosm-no_term, .phosm-no_osm_data { background: #fcefc7; color: #5c4400; }
+.phosm-filters { margin: 16px 0 10px; }
+.phosm-total { margin-left: 8px; color: #646970; }
+.phosm-log-actions { margin: 16px 0 10px; }
+.phosm-log-error td { color: #b32d2e; }
+.phosm-log-warning td { color: #996800; }
+.phosm-error-text { color: #b32d2e; }
+.phosm-check { margin-right: 12px; }
