@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Property Hive OSM Location Checker
  * Description: Uses OpenStreetMap (Nominatim) to look up each property's neighbourhood / suburb and compares it against what has been entered manually (Location taxonomy and custom fields such as Suburb and Region), to see how reliably these could be assigned automatically.
- * Version: 1.1.2
+ * Version: 1.1.3
  * Author: Property Hive
  * Requires at least: 5.6
  * Requires PHP: 7.2
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 final class PH_OSM_Location_Checker {
 
-	const VERSION     = '1.1.2';
+	const VERSION     = '1.1.3';
 	const DB_VERSION  = '2';
 	const OPTION      = 'phosm_settings';
 	const PAGE_SLUG   = 'ph-osm-location-checker';
@@ -185,7 +185,7 @@ final class PH_OSM_Location_Checker {
 			'on_market_only'   => 0,
 			'statuses'         => array( 'publish' ),
 			'location_target'  => 1,
-			'meta_targets'     => "_suburb|name|Suburb\n_region|group|Region",
+			'meta_targets'     => "_suburb|name|Suburb|suburb\n_region|group|Region",
 		);
 	}
 
@@ -220,10 +220,13 @@ final class PH_OSM_Location_Checker {
 			}
 			$type  = in_array( $parts[1] ?? '', array( 'name', 'group' ), true ) ? $parts[1] : 'name';
 			$label = ( isset( $parts[2] ) && '' !== $parts[2] ) ? $parts[2] : $key;
-			$targets[ $key ] = array( 'type' => $type, 'label' => $label );
+			// Optional 4th part: which OSM fields may be used to pick the value, in priority order.
+			$allowed = array_merge( self::$fields, array( self::POSTCODE_FEATURE ) );
+			$fields  = array_values( array_intersect( array_map( 'trim', explode( ',', strtolower( $parts[3] ?? '' ) ) ), $allowed ) );
+			$targets[ $key ] = array( 'type' => $type, 'label' => $label, 'fields' => $fields );
 		}
 		if ( $settings['location_target'] ) {
-			$targets['location'] = array( 'type' => 'taxonomy', 'label' => __( 'Location (taxonomy)', 'ph-osm-location-checker' ) );
+			$targets['location'] = array( 'type' => 'taxonomy', 'label' => __( 'Location (taxonomy)', 'ph-osm-location-checker' ), 'fields' => array() );
 		}
 		return $targets;
 	}
@@ -1046,7 +1049,8 @@ final class PH_OSM_Location_Checker {
 							<?php esc_html_e( 'One per line: meta_key|type|Label. Type is:', 'ph-osm-location-checker' ); ?><br>
 							<code>name</code> – <?php esc_html_e( 'the field holds an area name (e.g. _suburb = "Kings Norton") and is compared directly with OSM neighbourhood/suburb etc.', 'ph-osm-location-checker' ); ?><br>
 							<code>group</code> – <?php esc_html_e( 'the field holds your own grouping that OSM does not know (e.g. _region = "Birmingham South"). The plugin learns which group each OSM area / postcode district belongs to from your existing properties and tests that.', 'ph-osm-location-checker' ); ?><br>
-							<?php esc_html_e( 'Multi-select fields are supported. Changing this needs no new OSM lookups.', 'ph-osm-location-checker' ); ?>
+							<?php esc_html_e( 'Optional 4th part: the OSM fields allowed to supply the value, comma separated, in priority order, e.g. _suburb|name|Suburb|suburb or …|suburb,neighbourhood. Leave it off to try every OSM field from most specific (neighbourhood) to least (city). For group fields, postcode_district is also available.', 'ph-osm-location-checker' ); ?><br>
+							<?php esc_html_e( 'Multi-select and comma-separated values are supported. Changing this needs no new OSM lookups.', 'ph-osm-location-checker' ); ?>
 						</p>
 					</td>
 				</tr>
@@ -1198,9 +1202,9 @@ final class PH_OSM_Location_Checker {
 		if ( $property_id ) {
 			foreach ( self::targets() as $key => $t ) {
 				if ( 'taxonomy' === $t['type'] ) {
-					$c = $this->compare_taxonomy( $property_id, $address );
+					$c = $this->compare_taxonomy( $property_id, $address, $t['fields'] );
 				} elseif ( 'name' === $t['type'] ) {
-					$c = $this->compare_name( $property_id, $key, $address );
+					$c = $this->compare_name( $property_id, $key, $address, $t['fields'] );
 				} else {
 					continue; // group fields need the whole data set; see the stats page.
 				}
@@ -1624,7 +1628,7 @@ final class PH_OSM_Location_Checker {
 	 * Comparison: taxonomy
 	 * ------------------------------------------------------------------- */
 
-	public function compare_taxonomy( $property_id, $address ) {
+	public function compare_taxonomy( $property_id, $address, $use_fields = array() ) {
 		$this->load_terms();
 		$osm = $this->osm_values( $address );
 
@@ -1644,7 +1648,7 @@ final class PH_OSM_Location_Checker {
 			$term_id = $this->find_term( $value, $osm );
 			$correct = $term_id && in_array( $term_id, $assigned, true );
 			$fields[ $field ] = array( 'value' => $value, 'known' => (bool) $term_id, 'correct' => $correct );
-			if ( $term_id && ! $suggested_id ) {
+			if ( $term_id && ! $suggested_id && ( ! $use_fields || in_array( $field, $use_fields, true ) ) ) {
 				$suggested_id    = $term_id;
 				$suggested_field = $field;
 			}
@@ -1685,7 +1689,7 @@ final class PH_OSM_Location_Checker {
 	 * Comparison: free-text name field (e.g. _suburb)
 	 * ------------------------------------------------------------------- */
 
-	public function compare_name( $property_id, $key, $address ) {
+	public function compare_name( $property_id, $key, $address, $use_fields = array() ) {
 		$vocab   = $this->load_vocab( $key );
 		$osm     = $this->osm_values( $address );
 		$current = self::meta_values( $property_id, $key );
@@ -1700,18 +1704,25 @@ final class PH_OSM_Location_Checker {
 			$known   = isset( $vocab[ $n ] );
 			$correct = in_array( $n, $cur_n, true );
 			$fields[ $field ] = array( 'value' => $value, 'known' => $known, 'correct' => $correct );
-			if ( $known && '' === $suggested ) {
-				$suggested       = $vocab[ $n ];
-				$suggested_field = $field;
-			}
 			if ( $correct && ! $matched_field ) {
 				$matched_field = $field;
 			}
 		}
 
-		// Nothing in OSM is an existing value: automation would write the raw OSM neighbourhood/suburb.
+		// Pick the value automation would write: the first allowed OSM field (in the configured order,
+		// or most specific first) whose value is already in use on another property.
+		$order = $use_fields ? $use_fields : array_keys( $osm );
+		foreach ( $order as $field ) {
+			if ( isset( $fields[ $field ] ) && $fields[ $field ]['known'] ) {
+				$suggested       = $vocab[ self::normalise( $osm[ $field ] ) ];
+				$suggested_field = $field;
+				break;
+			}
+		}
+
+		// Nothing allowed is an existing value: automation would write the raw OSM value.
 		if ( '' === $suggested ) {
-			foreach ( self::$primary_fields as $f ) {
+			foreach ( ( $use_fields ? $use_fields : self::$primary_fields ) as $f ) {
 				if ( isset( $osm[ $f ] ) ) {
 					$suggested       = $osm[ $f ];
 					$suggested_field = $f . ' (new)';
@@ -1754,7 +1765,7 @@ final class PH_OSM_Location_Checker {
 	 * @param array  $items property_id => array( 'features' => array( field => display ), 'current' => array( values ) )
 	 * @return array property_id => compare row
 	 */
-	public function compare_group( $key, $items ) {
+	public function compare_group( $key, $items, $use_fields = array() ) {
 		// counts[feature][normalised value][group display] = n.
 		$counts   = array();
 		$displays = array();
@@ -1821,6 +1832,9 @@ final class PH_OSM_Location_Checker {
 		}
 		arsort( $order );
 		$order = array_keys( $order );
+		if ( $use_fields ) {
+			$order = array_values( array_intersect( $use_fields, $order ) ); // fixed order, as configured
+		}
 
 		// Remember the learned mapping for the best feature, to show on the stats page.
 		if ( $order ) {
@@ -1921,9 +1935,9 @@ final class PH_OSM_Location_Checker {
 			if ( $is_err ) {
 				$row = $this->error_compare_row( 'taxonomy' === $t['type'] ? '' : implode( ', ', self::meta_values( $property_id, $key ) ) );
 			} elseif ( 'taxonomy' === $t['type'] ) {
-				$row = $this->compare_taxonomy( $property_id, $address );
+				$row = $this->compare_taxonomy( $property_id, $address, $t['fields'] );
 			} else {
-				$row = $this->compare_name( $property_id, $key, $address );
+				$row = $this->compare_name( $property_id, $key, $address, $t['fields'] );
 			}
 			$this->save_compare( $property_id, $key, $row );
 			$out[ $key ] = $row;
@@ -1960,6 +1974,7 @@ final class PH_OSM_Location_Checker {
 			update_object_term_cache( $chunk, 'property' );
 		}
 		$this->vocab      = array();
+		$targets          = self::targets();
 		$this->term_index = null;
 
 		$group_items = array();
@@ -1984,7 +1999,7 @@ final class PH_OSM_Location_Checker {
 		}
 
 		foreach ( $group_items as $key => $items ) {
-			foreach ( $this->compare_group( $key, $items ) as $pid => $row ) {
+			foreach ( $this->compare_group( $key, $items, $targets[ $key ]['fields'] ) as $pid => $row ) {
 				$this->save_compare( $pid, $key, $row );
 			}
 		}
