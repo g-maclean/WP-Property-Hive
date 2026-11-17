@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Property Hive OSM Location Checker
  * Description: Uses OpenStreetMap (Nominatim) to look up each property's neighbourhood / suburb and compares it against what has been entered manually (Location taxonomy and custom fields such as Suburb and Region), to see how reliably these could be assigned automatically.
- * Version: 1.1.1
+ * Version: 1.1.2
  * Author: Property Hive
  * Requires at least: 5.6
  * Requires PHP: 7.2
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 final class PH_OSM_Location_Checker {
 
-	const VERSION     = '1.1.1';
+	const VERSION     = '1.1.2';
 	const DB_VERSION  = '2';
 	const OPTION      = 'phosm_settings';
 	const PAGE_SLUG   = 'ph-osm-location-checker';
@@ -1501,16 +1501,33 @@ final class PH_OSM_Location_Checker {
 		return $osm;
 	}
 
-	/** All values of a meta key on a property, flattening multi-selects/serialized arrays. */
+	/**
+	 * Split a stored meta value into individual values: multi-selects/serialized arrays, and
+	 * text fields holding several areas, e.g. "Birmingham City Centre, Jewellery Quarter".
+	 */
+	public static function split_values( $raw ) {
+		$values = array();
+		foreach ( (array) maybe_unserialize( $raw ) as $v ) {
+			if ( ! is_scalar( $v ) ) {
+				continue;
+			}
+			$separators = (string) apply_filters( 'phosm_value_separators', ',;|' );
+			$parts      = '' === $separators ? array( (string) $v ) : preg_split( '/[' . preg_quote( $separators, '/' ) . ']+/', (string) $v );
+			foreach ( $parts as $part ) {
+				$part = trim( $part );
+				if ( '' !== $part ) {
+					$values[] = $part;
+				}
+			}
+		}
+		return $values;
+	}
+
+	/** All values of a meta key on a property. */
 	public static function meta_values( $property_id, $key ) {
 		$values = array();
 		foreach ( (array) get_post_meta( $property_id, $key, false ) as $raw ) {
-			$raw = maybe_unserialize( $raw );
-			foreach ( (array) $raw as $v ) {
-				if ( is_scalar( $v ) && '' !== trim( (string) $v ) ) {
-					$values[] = trim( (string) $v );
-				}
-			}
+			$values = array_merge( $values, self::split_values( $raw ) );
 		}
 		return array_values( array_unique( $values ) );
 	}
@@ -1545,9 +1562,9 @@ final class PH_OSM_Location_Checker {
 		$vocab = array();
 		$raws  = $wpdb->get_col( $wpdb->prepare( "SELECT DISTINCT pm.meta_value FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id WHERE pm.meta_key = %s AND p.post_type = 'property'", $key ) );
 		foreach ( $raws as $raw ) {
-			foreach ( (array) maybe_unserialize( $raw ) as $v ) {
-				if ( is_scalar( $v ) && '' !== ( $n = self::normalise( $v ) ) && ! isset( $vocab[ $n ] ) ) {
-					$vocab[ $n ] = trim( (string) $v );
+			foreach ( self::split_values( $raw ) as $v ) {
+				if ( '' !== ( $n = self::normalise( $v ) ) && ! isset( $vocab[ $n ] ) ) {
+					$vocab[ $n ] = $v;
 				}
 			}
 		}
