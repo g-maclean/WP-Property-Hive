@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Property Hive OSM Location Checker
  * Description: Uses OpenStreetMap (Nominatim) to look up each property's neighbourhood / suburb and compares it against what has been entered manually (Location taxonomy and custom fields such as Suburb and Region), to see how reliably these could be assigned automatically.
- * Version: 1.1.0
+ * Version: 1.1.1
  * Author: Property Hive
  * Requires at least: 5.6
  * Requires PHP: 7.2
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 final class PH_OSM_Location_Checker {
 
-	const VERSION     = '1.1.0';
+	const VERSION     = '1.1.1';
 	const DB_VERSION  = '2';
 	const OPTION      = 'phosm_settings';
 	const PAGE_SLUG   = 'ph-osm-location-checker';
@@ -56,6 +56,8 @@ final class PH_OSM_Location_Checker {
 	private $terms = array();
 	/** @var array meta key => array( normalised => display ) */
 	private $vocab = array();
+	/** @var array Details of the last OSM request, for the test tool. */
+	private $last_request = array();
 
 	public static function instance() {
 		if ( null === self::$instance ) {
@@ -73,6 +75,7 @@ final class PH_OSM_Location_Checker {
 
 		add_action( 'wp_ajax_phosm_step', array( $this, 'ajax_step' ) );
 		add_action( 'wp_ajax_phosm_stats', array( $this, 'ajax_stats' ) );
+		add_action( 'wp_ajax_phosm_test', array( $this, 'ajax_test' ) );
 
 		add_action( 'admin_post_phosm_save_settings', array( $this, 'handle_save_settings' ) );
 		add_action( 'admin_post_phosm_reset', array( $this, 'handle_reset' ) );
@@ -443,6 +446,19 @@ final class PH_OSM_Location_Checker {
 				?>
 			</div>
 			<p class="description"><?php esc_html_e( '“Re-compare” makes no OSM requests: use it after editing suburbs/regions/Locations to see how the numbers change.', 'ph-osm-location-checker' ); ?></p>
+		</div>
+
+		<div class="phosm-card">
+			<h2><?php esc_html_e( 'Test a lookup', 'ph-osm-location-checker' ); ?></h2>
+			<p class="description"><?php esc_html_e( 'Look up a single property or coordinate and see exactly what OSM returns. Nothing is saved.', 'ph-osm-location-checker' ); ?></p>
+			<div class="phosm-controls">
+				<label><?php esc_html_e( 'Property ID', 'ph-osm-location-checker' ); ?> <input type="number" id="phosm-test-id" class="small-text"></label>
+				<?php esc_html_e( 'or', 'ph-osm-location-checker' ); ?>
+				<label><?php esc_html_e( 'Lat', 'ph-osm-location-checker' ); ?> <input type="text" id="phosm-test-lat" class="regular-text phosm-coord"></label>
+				<label><?php esc_html_e( 'Lng', 'ph-osm-location-checker' ); ?> <input type="text" id="phosm-test-lng" class="regular-text phosm-coord"></label>
+				<button type="button" class="button" id="phosm-test"><?php esc_html_e( 'Test', 'ph-osm-location-checker' ); ?></button>
+			</div>
+			<pre id="phosm-test-output" class="phosm-test-output" hidden></pre>
 		</div>
 
 		<div class="phosm-card">
@@ -1116,6 +1132,93 @@ final class PH_OSM_Location_Checker {
 	}
 
 	/* ---------------------------------------------------------------------
+	 * AJAX: test a single lookup (nothing saved)
+	 * ------------------------------------------------------------------- */
+
+	public function ajax_test() {
+		$this->check_ajax();
+
+		$property_id = absint( $_POST['property_id'] ?? 0 );
+		$out         = array();
+		if ( $property_id ) {
+			if ( 'property' !== get_post_type( $property_id ) ) {
+				wp_send_json_error( array( 'message' => 'Post #' . $property_id . ' is not a property.' ) );
+			}
+			$lat_raw = get_post_meta( $property_id, '_latitude', true );
+			$lng_raw = get_post_meta( $property_id, '_longitude', true );
+			$out['property'] = array(
+				'title'      => get_the_title( $property_id ),
+				'_latitude'  => $lat_raw,
+				'_longitude' => $lng_raw,
+				'address'    => $this->address_query( $property_id ),
+			);
+			foreach ( self::targets() as $key => $t ) {
+				if ( 'taxonomy' !== $t['type'] ) {
+					$out['property'][ $key ] = implode( ', ', self::meta_values( $property_id, $key ) );
+				}
+			}
+		} else {
+			$lat_raw = wp_unslash( $_POST['lat'] ?? '' );
+			$lng_raw = wp_unslash( $_POST['lng'] ?? '' );
+		}
+
+		$lat = self::parse_coord( $lat_raw );
+		$lng = self::parse_coord( $lng_raw );
+		$out['parsed_coordinates'] = array( 'lat' => $lat, 'lng' => $lng );
+
+		if ( null === $lat || null === $lng || ( 0.0 === $lat && 0.0 === $lng ) || abs( $lat ) > 90 || abs( $lng ) > 180 ) {
+			$out['error'] = 'No valid latitude/longitude' . ( $property_id ? ' on this property – a run would use the address search fallback (if enabled).' : '.' );
+			wp_send_json_success( $out );
+		}
+
+		$response              = $this->nominatim( 'reverse', array( 'lat' => $lat, 'lon' => $lng, 'zoom' => 18 ) );
+		$out['request']        = $this->last_request;
+		if ( isset( $out['request']['body'] ) ) {
+			$decoded = json_decode( $out['request']['body'], true );
+			$out['request']['body'] = null !== $decoded ? $decoded : mb_substr( $out['request']['body'], 0, 2000 );
+		}
+
+		if ( is_wp_error( $response ) ) {
+			$out['error'] = $response->get_error_message();
+			wp_send_json_success( $out );
+		}
+		if ( isset( $response['error'] ) ) {
+			$out['error'] = 'OSM: ' . ( is_string( $response['error'] ) ? $response['error'] : wp_json_encode( $response['error'] ) );
+		}
+
+		$address               = isset( $response['address'] ) && is_array( $response['address'] ) ? $response['address'] : array();
+		$out['osm_areas_used'] = $this->osm_values( $address );
+		if ( ! empty( $address['postcode'] ) ) {
+			$out['osm_areas_used'][ self::POSTCODE_FEATURE ] = self::postcode_district( $address['postcode'] );
+		}
+		if ( ! $out['osm_areas_used'] ) {
+			$out['note'] = 'OSM returned an address but none of the area fields this plugin uses (' . implode( ', ', self::$fields ) . ').';
+		}
+
+		if ( $property_id ) {
+			foreach ( self::targets() as $key => $t ) {
+				if ( 'taxonomy' === $t['type'] ) {
+					$c = $this->compare_taxonomy( $property_id, $address );
+				} elseif ( 'name' === $t['type'] ) {
+					$c = $this->compare_name( $property_id, $key, $address );
+				} else {
+					continue; // group fields need the whole data set; see the stats page.
+				}
+				unset( $c['details'] );
+				$out['comparison'][ $t['label'] ] = $c;
+			}
+		}
+
+		wp_send_json_success( $out );
+	}
+
+	/** Accept "52.48", " 52,48 " (decimal comma) etc. Returns float or null. */
+	public static function parse_coord( $value ) {
+		$value = trim( str_replace( ',', '.', (string) $value ) );
+		return is_numeric( $value ) ? (float) $value : null;
+	}
+
+	/* ---------------------------------------------------------------------
 	 * AJAX step: process exactly one property
 	 * ------------------------------------------------------------------- */
 
@@ -1178,9 +1281,9 @@ final class PH_OSM_Location_Checker {
 	 */
 	public function process_property( $property_id ) {
 		$settings = self::settings();
-		$lat      = (float) get_post_meta( $property_id, '_latitude', true );
-		$lng      = (float) get_post_meta( $property_id, '_longitude', true );
-		$has_ll   = ( 0.0 !== $lat || 0.0 !== $lng ) && abs( $lat ) <= 90 && abs( $lng ) <= 180;
+		$lat      = self::parse_coord( get_post_meta( $property_id, '_latitude', true ) );
+		$lng      = self::parse_coord( get_post_meta( $property_id, '_longitude', true ) );
+		$has_ll   = null !== $lat && null !== $lng && ( 0.0 !== $lat || 0.0 !== $lng ) && abs( $lat ) <= 90 && abs( $lng ) <= 180;
 
 		$row = array(
 			'property_id' => $property_id,
@@ -1237,6 +1340,9 @@ final class PH_OSM_Location_Checker {
 		}
 
 		$address = ( ! isset( $response['error'] ) && isset( $response['address'] ) && is_array( $response['address'] ) ) ? $response['address'] : array();
+		if ( isset( $response['error'] ) ) {
+			$this->log( 'warning', 'OSM returned: ' . ( is_string( $response['error'] ) ? $response['error'] : wp_json_encode( $response['error'] ) ), $property_id );
+		}
 
 		$row['osm_display_name']  = $response['display_name'] ?? '';
 		$row['osm_address']       = wp_json_encode( $address );
@@ -1303,6 +1409,7 @@ final class PH_OSM_Location_Checker {
 
 		$this->throttle( $settings['delay'] );
 
+		$this->last_request = array( 'url' => $url );
 		$response = wp_remote_get(
 			$url,
 			array(
@@ -1313,23 +1420,29 @@ final class PH_OSM_Location_Checker {
 		);
 
 		if ( is_wp_error( $response ) ) {
-			return $response;
+			$this->last_request['error'] = $response->get_error_message();
+			return new WP_Error( 'request_failed', 'Request to OSM failed: ' . $response->get_error_message() );
 		}
 
 		$code = (int) wp_remote_retrieve_response_code( $response );
+		$body = (string) wp_remote_retrieve_body( $response );
+		$this->last_request['http_code'] = $code;
+		$this->last_request['body']      = $body;
+		$snippet = trim( mb_substr( wp_strip_all_tags( $body ), 0, 200 ) );
+
 		if ( 429 === $code ) {
-			return new WP_Error( 'rate_limited', 'HTTP 429 Too Many Requests from OSM' );
+			return new WP_Error( 'rate_limited', 'HTTP 429 Too Many Requests from OSM. ' . $snippet );
 		}
 		if ( 403 === $code || 418 === $code ) {
-			return new WP_Error( 'blocked', 'HTTP ' . $code . ' from OSM – access blocked. Check the usage policy and contact email.' );
+			return new WP_Error( 'blocked', 'HTTP ' . $code . ' from OSM – access blocked. Check the usage policy and contact email. ' . $snippet );
 		}
 		if ( 200 !== $code ) {
-			return new WP_Error( 'http_' . $code, 'HTTP ' . $code . ' from OSM' );
+			return new WP_Error( 'http_' . $code, 'HTTP ' . $code . ' from OSM. ' . $snippet );
 		}
 
-		$data = json_decode( wp_remote_retrieve_body( $response ), true );
+		$data = json_decode( $body, true );
 		if ( null === $data ) {
-			return new WP_Error( 'bad_json', 'Invalid JSON returned by OSM' );
+			return new WP_Error( 'bad_json', 'Invalid JSON returned by OSM: ' . $snippet );
 		}
 		return $data;
 	}

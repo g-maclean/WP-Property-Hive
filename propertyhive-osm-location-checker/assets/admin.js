@@ -8,6 +8,25 @@ jQuery( function ( $ ) {
 		$log = $( '#phosm-live-log' ),
 		state = null;
 
+	$( '#phosm-test' ).on( 'click', function () {
+		var $btn = $( this ), $out = $( '#phosm-test-output' );
+		$btn.prop( 'disabled', true );
+		$out.prop( 'hidden', false ).text( 'Looking up…' );
+		$.post( phosm.ajaxUrl, {
+			action: 'phosm_test',
+			nonce: phosm.nonce,
+			property_id: $( '#phosm-test-id' ).val(),
+			lat: $( '#phosm-test-lat' ).val(),
+			lng: $( '#phosm-test-lng' ).val()
+		} ).done( function ( res ) {
+			$out.text( JSON.stringify( res && res.data ? res.data : res, null, 2 ) );
+		} ).fail( function ( xhr ) {
+			$out.text( 'Request failed: HTTP ' + xhr.status + '\n' + ( xhr.responseText || '' ).slice( 0, 2000 ) );
+		} ).always( function () {
+			$btn.prop( 'disabled', false );
+		} );
+	} );
+
 	if ( ! $start.length ) {
 		return;
 	}
