@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Property Hive OSM Location Checker
  * Description: Uses OpenStreetMap (Nominatim) to look up each property's neighbourhood / suburb and compares it against what has been entered manually (Location taxonomy and custom fields such as Suburb and Region), to see how reliably these could be assigned automatically.
- * Version: 1.1.3
+ * Version: 1.1.4
  * Author: Property Hive
  * Requires at least: 5.6
  * Requires PHP: 7.2
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 final class PH_OSM_Location_Checker {
 
-	const VERSION     = '1.1.3';
+	const VERSION     = '1.1.4';
 	const DB_VERSION  = '2';
 	const OPTION      = 'phosm_settings';
 	const PAGE_SLUG   = 'ph-osm-location-checker';
@@ -223,6 +223,9 @@ final class PH_OSM_Location_Checker {
 			// Optional 4th part: which OSM fields may be used to pick the value, in priority order.
 			$allowed = array_merge( self::$fields, array( self::POSTCODE_FEATURE ) );
 			$fields  = array_values( array_intersect( array_map( 'trim', explode( ',', strtolower( $parts[3] ?? '' ) ) ), $allowed ) );
+			if ( ! $fields && 'name' === $type ) {
+				$fields = array( 'suburb' ); // name fields use OSM suburb unless told otherwise
+			}
 			$targets[ $key ] = array( 'type' => $type, 'label' => $label, 'fields' => $fields );
 		}
 		if ( $settings['location_target'] ) {
@@ -1049,7 +1052,7 @@ final class PH_OSM_Location_Checker {
 							<?php esc_html_e( 'One per line: meta_key|type|Label. Type is:', 'ph-osm-location-checker' ); ?><br>
 							<code>name</code> – <?php esc_html_e( 'the field holds an area name (e.g. _suburb = "Kings Norton") and is compared directly with OSM neighbourhood/suburb etc.', 'ph-osm-location-checker' ); ?><br>
 							<code>group</code> – <?php esc_html_e( 'the field holds your own grouping that OSM does not know (e.g. _region = "Birmingham South"). The plugin learns which group each OSM area / postcode district belongs to from your existing properties and tests that.', 'ph-osm-location-checker' ); ?><br>
-							<?php esc_html_e( 'Optional 4th part: the OSM fields allowed to supply the value, comma separated, in priority order, e.g. _suburb|name|Suburb|suburb or …|suburb,neighbourhood. Leave it off to try every OSM field from most specific (neighbourhood) to least (city). For group fields, postcode_district is also available.', 'ph-osm-location-checker' ); ?><br>
+							<?php esc_html_e( 'Optional 4th part: the OSM fields allowed to supply the value, comma separated, in priority order, e.g. _suburb|name|Suburb|suburb or …|suburb,neighbourhood. Leave it off and name fields use OSM suburb only; group fields try every OSM field. For group fields, postcode_district is also available.', 'ph-osm-location-checker' ); ?><br>
 							<?php esc_html_e( 'Multi-select and comma-separated values are supported. Changing this needs no new OSM lookups.', 'ph-osm-location-checker' ); ?>
 						</p>
 					</td>
@@ -2100,7 +2103,7 @@ final class PH_OSM_Location_Checker {
 		$results  = self::results_table();
 		$rows     = $wpdb->get_results( "SELECT r.*, p.post_title FROM {$results} r LEFT JOIN {$wpdb->posts} p ON p.ID = r.property_id ORDER BY r.property_id", ARRAY_A ); // phpcs:ignore
 		$compared = array();
-		foreach ( $wpdb->get_results( 'SELECT property_id, target, current_value, suggested, suggested_field, matched_field, outcome FROM ' . self::compare_table(), ARRAY_A ) as $c ) { // phpcs:ignore
+		foreach ( $wpdb->get_results( 'SELECT property_id, target, current_value, suggested, suggested_field, matched_field, outcome, details FROM ' . self::compare_table(), ARRAY_A ) as $c ) { // phpcs:ignore
 			$compared[ $c['property_id'] ][ $c['target'] ] = $c;
 		}
 
@@ -2110,6 +2113,13 @@ final class PH_OSM_Location_Checker {
 
 		$header = array( 'property_id', 'title', 'source', 'lat', 'lng', 'osm_neighbourhood', 'osm_suburb', 'osm_postcode', 'osm_other_areas', 'osm_display_name', 'error' );
 		foreach ( $targets as $t ) {
+			if ( 'name' === $t['type'] ) {
+				// Simple yes/no columns for the main OSM field (e.g. OSM suburb vs the entered _suburb).
+				$f        = $t['fields'] ? $t['fields'][0] : 'suburb';
+				$header[] = 'OSM ' . $f;
+				$header[] = 'OSM ' . $f . ' matches entered ' . $t['label'];
+				$header[] = 'OSM ' . $f . ' is new ' . $t['label'];
+			}
 			foreach ( array( 'entered', 'would_assign', 'from_field', 'matched_field', 'outcome' ) as $col ) {
 				$header[] = $t['label'] . ' ' . $col;
 			}
@@ -2128,8 +2138,18 @@ final class PH_OSM_Location_Checker {
 				}
 			}
 			$line = array( $r['property_id'], $r['post_title'], $r['source'], $r['lat'], $r['lng'], $r['osm_neighbourhood'], $r['osm_suburb'], $r['osm_postcode'], implode( '; ', $other ), $r['osm_display_name'], $r['error'] );
-			foreach ( array_keys( $targets ) as $key ) {
+			foreach ( $targets as $key => $t ) {
 				$c = $compared[ $r['property_id'] ][ $key ] ?? array();
+				if ( 'name' === $t['type'] ) {
+					$f       = $t['fields'] ? $t['fields'][0] : 'suburb';
+					$value   = is_array( $address ) && ! empty( $address[ $f ] ) && is_string( $address[ $f ] ) ? trim( $address[ $f ] ) : '';
+					$details = json_decode( (string) ( $c['details'] ?? '' ), true );
+					$info    = $details['fields'][ $f ] ?? array();
+					$line[]  = $value;
+					// Blank when OSM had no value for the field, so "no" always means a real disagreement / existing value.
+					$line[]  = ( '' === $value || '' === (string) ( $c['current_value'] ?? '' ) ) ? '' : ( ! empty( $info['correct'] ) ? 'yes' : 'no' );
+					$line[]  = '' === $value ? '' : ( ! empty( $info['known'] ) ? 'no' : 'yes' );
+				}
 				foreach ( array( 'current_value', 'suggested', 'suggested_field', 'matched_field', 'outcome' ) as $col ) {
 					$line[] = $c[ $col ] ?? '';
 				}
