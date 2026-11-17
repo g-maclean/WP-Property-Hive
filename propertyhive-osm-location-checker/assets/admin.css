@@ -27,3 +27,7 @@
 .phosm-log-warning td { color: #996800; }
 .phosm-error-text { color: #b32d2e; }
 .phosm-check { margin-right: 12px; }
+.phosm-no_prediction { background: #fcefc7; color: #5c4400; }
+.phosm-targets { float: none; margin: 12px 0 0; font-size: 14px; }
+.phosm-scroll { max-height: 420px; overflow: auto; margin-bottom: 20px; }
+.phosm-ambiguous td { background: #fff8e5; }

@@ -57,9 +57,10 @@ jQuery( function ( $ ) {
 		addLog( 'Run ended: ' + reason, 'phosm-live-info' );
 		state = null;
 
-		$.post( phosm.ajaxUrl, { action: 'phosm_stats', nonce: phosm.nonce } ).done( function ( res ) {
+		$( '#phosm-stats' ).css( 'opacity', 0.5 ).prepend( $( '<p>' ).text( phosm.i18n.stats ) );
+		$.post( phosm.ajaxUrl, { action: 'phosm_stats', nonce: phosm.nonce, target: $( '#phosm-stats' ).data( 'target' ) } ).done( function ( res ) {
 			if ( res && res.success ) {
-				$( '#phosm-stats' ).html( res.data.html );
+				$( '#phosm-stats' ).html( res.data.html ).css( 'opacity', 1 );
 				updateCounts( res.data.counts );
 				if ( res.data.counts && 0 === res.data.counts.remaining ) {
 					$start.prop( 'disabled', true );
@@ -106,7 +107,7 @@ jQuery( function ( $ ) {
 			}
 
 			state.processed++;
-			addLog( '#' + d.property_id + ' ' + d.title + ' — ' + d.label + ': ' + d.message, 'phosm-live-' + d.outcome );
+			addLog( '#' + d.property_id + ' ' + d.title + ' — ' + d.message, 'phosm-live-' + d.outcome );
 
 			if ( d.halt ) {
 				return finish( 'OSM refused requests (' + d.message + '). Wait before running again.' );
