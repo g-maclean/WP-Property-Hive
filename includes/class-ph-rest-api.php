@@ -93,6 +93,7 @@ class PH_Rest_Api {
 		add_action( 'rest_api_init', array( $this, 'register_rest_api_property_fields' ), 99 );
 		add_filter( 'rest_property_collection_params', array( $this, 'modify_rest_order_by' ), 10, 1 );
 		add_action( "rest_after_insert_property", array( $this, 'ensure_key_property_fields_set' ), 10, 3 );
+		add_action( 'rest_api_init', array( $this, 'register_property_by_ref_rest_route' ), 100 );
 
 		// Enquiry - Create
 		add_action( 'rest_api_init', array( $this, 'register_enquiry_rest_route' ), 11 );
@@ -275,6 +276,113 @@ class PH_Rest_Api {
 	            'permission_callback' => array( $this, 'enquiry_permission_check' )
 	        ),
 	    ));
+	}
+
+	/**
+	 * Register /wp/v2/property/ref/{ref}, a sibling of the core /wp/v2/property/{id} route
+	 * that finds the property by its exact reference number and then hands the request to
+	 * the core property controller, so all registered fields and update callbacks behave
+	 * exactly as they do when using the post ID.
+	 */
+	public function register_property_by_ref_rest_route()
+	{
+		$post_type_object = get_post_type_object( 'property' );
+		if ( ! $post_type_object || ! $post_type_object->show_in_rest ) {
+			return;
+		}
+
+		$controller = $post_type_object->get_rest_controller();
+		if ( ! $controller ) {
+			return;
+		}
+
+		$ref_arg = array(
+			'ref' => array(
+				'description' => __( 'The unique reference number of the property.', 'propertyhive' ),
+				'type'        => 'string',
+				'required'    => true,
+			),
+		);
+
+		register_rest_route( 'wp/v2', '/property/ref/(?P<ref>[^/]+)', array(
+			array(
+				'methods'             => WP_REST_Server::READABLE,
+				'callback'            => function ( WP_REST_Request $request ) use ( $controller ) {
+					return $controller->get_item( $request );
+				},
+				'permission_callback' => function ( WP_REST_Request $request ) use ( $controller ) {
+					$resolved = $this->resolve_property_ref_request( $request );
+					if ( is_wp_error( $resolved ) ) {
+						return $resolved;
+					}
+					return $controller->get_item_permissions_check( $request );
+				},
+				'args'                => array_merge( $ref_arg, array(
+					'context' => $controller->get_context_param( array( 'default' => 'view' ) ),
+				) ),
+			),
+			array(
+				'methods'             => WP_REST_Server::EDITABLE,
+				'callback'            => function ( WP_REST_Request $request ) use ( $controller ) {
+					return $controller->update_item( $request );
+				},
+				'permission_callback' => function ( WP_REST_Request $request ) use ( $controller ) {
+					$resolved = $this->resolve_property_ref_request( $request );
+					if ( is_wp_error( $resolved ) ) {
+						return $resolved;
+					}
+					return $controller->update_item_permissions_check( $request );
+				},
+				'args'                => array_merge( $controller->get_endpoint_args_for_item_schema( WP_REST_Server::EDITABLE ), $ref_arg ),
+			),
+			'schema' => array( $controller, 'get_public_item_schema' ),
+		) );
+	}
+
+	/**
+	 * Look up the property ID for the request's ref and set it as the request's 'id'
+	 * parameter so the core controller methods can be used unchanged.
+	 *
+	 * @return int|WP_Error Property post ID, or error if not found / not unique.
+	 */
+	private function resolve_property_ref_request( WP_REST_Request $request )
+	{
+		$ref = trim( sanitize_text_field( (string) $request->get_param( 'ref' ) ) );
+		if ( $ref === '' ) {
+			return new WP_Error( 'rest_property_invalid_ref', __( 'Invalid property reference number.', 'propertyhive' ), array( 'status' => 404 ) );
+		}
+
+		$property_ids = get_posts( array(
+			'post_type'        => 'property',
+			'post_status'      => array( 'publish', 'pending', 'draft', 'future', 'private' ),
+			'fields'           => 'ids',
+			'posts_per_page'   => 2,
+			'no_found_rows'    => true,
+			'suppress_filters' => true,
+			// phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- Exact lookup of a single property by its reference number for the REST ref route; limited to two results to detect duplicates.
+			'meta_query'       => array(
+				array(
+					'key'     => '_reference_number',
+					'value'   => $ref,
+					'compare' => '=',
+				),
+			),
+		) );
+
+		$property_ids = apply_filters( 'propertyhive_rest_api_property_ids_by_ref', $property_ids, $ref, $request );
+
+		if ( empty( $property_ids ) ) {
+			return new WP_Error( 'rest_post_invalid_id', __( 'No property found with that reference number.', 'propertyhive' ), array( 'status' => 404 ) );
+		}
+
+		if ( count( $property_ids ) > 1 ) {
+			return new WP_Error( 'rest_property_ref_not_unique', __( 'More than one property has that reference number.', 'propertyhive' ), array( 'status' => 409 ) );
+		}
+
+		$property_id = (int) $property_ids[0];
+		$request->set_param( 'id', $property_id );
+
+		return $property_id;
 	}
 
 	public function enquiry_permission_check() {
