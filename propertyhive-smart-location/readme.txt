@@ -1,7 +1,9 @@
-=== Property Hive Smart Location 2.0 ===
+=== Property Hive Smart Location 2.1 ===
 
 Assigns each property's suburb / neighbourhood / quarter as Property Hive Locations, creating
-Locations that don't exist yet, and optionally fills a region custom field.
+Locations that don't exist yet. Wider areas (e.g. a "Birmingham South" grouping) are handled by
+Location parents: put the suburb Locations under the right parent and searches on the parent
+include them.
 
 How it decides
 1. Skip: the property already has a Location known to be a suburb, neighbourhood or quarter
@@ -12,7 +14,8 @@ How it decides
    confidence are not used).
 Matching is by name ignoring case/punctuation. New suburbs are created under the OSM town/city
 Location (or as configured); new neighbourhoods/quarters under their suburb.
-Locations are only ever ADDED, never removed. A custom field can be used instead of Locations.
+Locations are only ever ADDED, never removed. A custom field can be used instead of Locations
+(only filled when empty).
 
 Known Location types
 The option `phsl_location_types` = array( 'suburb' => ids, 'neighbourhood' => ids, 'quarter' => ids )
@@ -28,7 +31,7 @@ no lookups. New lookups: max 20 / 60 seconds per import run, the rest via the 10
 Post meta (kept minimal)
 _phsl_status  assigned | suggested | not_found | retry | error | skipped
 _phsl         flags: t (time), o (OSM result), a (Claude: used/unsure/error/nokey), src,
-              l (Location ids assigned, for re-applying), n (retry count), v/r (pending suggestion)
+              l (Location ids assigned, for re-applying), n (retry count), v (pending suggestion)
 
 Log
 Monthly files in wp-content/uploads/ph-smart-location-logs/ (protected; random file-name suffix),

@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Property Hive Smart Location
- * Description: Automatically assigns a property's suburb as a Location (creating the Location if needed), and optionally a region, using OpenStreetMap with Claude AI as a fallback. Only empty fields are ever filled.
- * Version: 2.0.0
+ * Description: Automatically assigns a property's suburb as a Location (creating the Location if needed), using OpenStreetMap with Claude AI as a fallback. Only empty fields are ever filled.
+ * Version: 2.1.0
  * Author: Property Hive
  * Requires at least: 5.6
  * Requires PHP: 7.2
@@ -17,7 +17,7 @@ require_once __DIR__ . '/includes/class-phsl-logger.php';
 
 final class PH_Smart_Location {
 
-	const VERSION       = '2.0.0';
+	const VERSION       = '2.1.0';
 	const DB_VERSION    = '2';
 	const OPTION        = 'phsl_settings';
 	const PAGE_SLUG     = 'ph-smart-location';
@@ -40,7 +40,6 @@ final class PH_Smart_Location {
 	 *   src where the suburb came from (osm:suburb, claude, …)
 	 *   n   transient-failure count (while status is "retry")
 	 *   v   suggestion: list of array( f => OSM field, n => name, t => existing term id or 0, p => parent for a new term )
-	 *   r   suggested region
 	 * Everything else goes to the log file.
 	 *
 	 * The option phsl_location_types records which Location terms are suburbs / neighbourhoods /
@@ -166,12 +165,6 @@ final class PH_Smart_Location {
 			'claude_model'          => 'claude-opus-5-5',
 			'claude_api_key'        => '',
 			'claude_min_confidence' => 'medium',
-			'region_enabled'        => 0,
-			'region_key'            => '_region',
-			'region_multiple'       => 1,
-			'region_values'         => "Birmingham Central\nBirmingham North\nBirmingham South\nBirmingham East\nBirmingham West\nTowns Surrounding\nRural Surrounding",
-			'region_rules'          => '',
-			'region_use_claude'     => 1,
 			'endpoint'              => 'https://nominatim.openstreetmap.org',
 			'email'                 => '',
 			'delay'                 => 1.5,
@@ -217,10 +210,6 @@ final class PH_Smart_Location {
 		return self::settings()['use_claude'] && '' !== self::api_key();
 	}
 
-	public static function region_values() {
-		return array_values( array_unique( array_filter( array_map( 'trim', preg_split( '/\r\n|\r|\n/', (string) self::settings()['region_values'] ) ) ) ) );
-	}
-
 	public function handle_save_settings() {
 		$this->check_admin_request( 'phsl_save_settings' );
 		$p          = wp_unslash( $_POST );
@@ -250,12 +239,6 @@ final class PH_Smart_Location {
 			// Blank keeps the saved key (the field is never pre-filled); "-" removes it.
 			'claude_api_key'        => '-' === $key_in ? '' : ( '' === $key_in ? $old['claude_api_key'] : sanitize_text_field( $key_in ) ),
 			'claude_min_confidence' => in_array( $p['claude_min_confidence'] ?? '', array( 'high', 'medium', 'low' ), true ) ? $p['claude_min_confidence'] : 'medium',
-			'region_enabled'        => empty( $p['region_enabled'] ) ? 0 : 1,
-			'region_key'            => self::sanitize_meta_key( $p['region_key'] ?? '_region', '_region' ),
-			'region_multiple'       => empty( $p['region_multiple'] ) ? 0 : 1,
-			'region_values'         => sanitize_textarea_field( $p['region_values'] ?? '' ),
-			'region_rules'          => sanitize_textarea_field( $p['region_rules'] ?? '' ),
-			'region_use_claude'     => empty( $p['region_use_claude'] ) ? 0 : 1,
 			'endpoint'              => untrailingslashit( $endpoint ),
 			'email'                 => sanitize_email( $p['email'] ?? '' ),
 			'delay'                 => max( self::min_delay( $endpoint ), (float) ( $p['delay'] ?? 1.5 ) ),
@@ -329,18 +312,6 @@ final class PH_Smart_Location {
 			$values = array_merge( $values, self::split_values( $raw ) );
 		}
 		return array_values( array_unique( $values ) );
-	}
-
-	/** @return array( outward, sector ) e.g. ( 'B15', 'B15 2' ). */
-	public static function postcode_parts( $postcode ) {
-		$pc = strtoupper( preg_replace( '/\s+/', '', (string) $postcode ) );
-		if ( preg_match( '/^([A-Z]{1,2}[0-9][0-9A-Z]?)([0-9])([A-Z]{2})?$/', $pc, $m ) ) {
-			return array( $m[1], $m[1] . ' ' . $m[2] );
-		}
-		if ( preg_match( '/^[A-Z]{1,2}[0-9][0-9A-Z]?$/', $pc ) ) {
-			return array( $pc, '' );
-		}
-		return array( '', '' );
 	}
 
 	public static function parse_coord( $value ) {
@@ -522,23 +493,6 @@ final class PH_Smart_Location {
 		return ! self::meta_values( $property_id, self::settings()['suburb_key'] );
 	}
 
-	/** Names describing the property's current suburb (Location terms include their parents). */
-	private function current_suburb_names( $property_id ) {
-		if ( ! self::uses_taxonomy() ) {
-			return self::meta_values( $property_id, self::settings()['suburb_key'] );
-		}
-		$this->load_terms();
-		$names = array();
-		foreach ( $this->assigned_term_ids( $property_id ) as $id ) {
-			foreach ( array_merge( array( $id ), $this->term_ancestors( $id ) ) as $t ) {
-				if ( isset( $this->terms[ $t ] ) ) {
-					$names[] = $this->terms[ $t ]->name;
-				}
-			}
-		}
-		return array_values( array_unique( $names ) );
-	}
-
 	private function current_suburb_label( $property_id ) {
 		if ( ! self::uses_taxonomy() ) {
 			return implode( ', ', self::meta_values( $property_id, self::settings()['suburb_key'] ) );
@@ -563,57 +517,6 @@ final class PH_Smart_Location {
 			}
 		}
 		return $this->vocab = $vocab;
-	}
-
-	/* ---------- Region rules ---------- */
-
-	/** "Birmingham South = Edgbaston, Selly Oak, B30, B15 2" – suburbs, postcode districts or sectors. */
-	public static function region_rules() {
-		$rules = array();
-		foreach ( preg_split( '/\r\n|\r|\n/', (string) self::settings()['region_rules'] ) as $line ) {
-			if ( false === strpos( $line, '=' ) ) {
-				continue;
-			}
-			list( $region, $terms ) = array_map( 'trim', explode( '=', $line, 2 ) );
-			if ( '' === $region ) {
-				continue;
-			}
-			$rule = array( 'region' => $region, 'suburbs' => array(), 'postcodes' => array() );
-			foreach ( explode( ',', $terms ) as $term ) {
-				$term = trim( $term );
-				if ( '' === $term ) {
-					continue;
-				}
-				if ( preg_match( '/^[A-Z]{1,2}[0-9][0-9A-Z]?( ?[0-9])?$/i', $term ) ) {
-					$rule['postcodes'][] = strtoupper( preg_replace( '/^([A-Z]{1,2}[0-9][0-9A-Z]?) ?([0-9])$/i', '$1 $2', $term ) );
-				} else {
-					$rule['suburbs'][] = self::normalise( $term );
-				}
-			}
-			$rules[] = $rule;
-		}
-		return $rules;
-	}
-
-	public static function region_from_rules( $suburbs, $postcode ) {
-		$rules = self::region_rules();
-		$norm  = array_map( array( __CLASS__, 'normalise' ), (array) $suburbs );
-		foreach ( $rules as $r ) {
-			foreach ( $norm as $n ) {
-				if ( in_array( $n, $r['suburbs'], true ) ) {
-					return array( $r['region'], 'rule:suburb' );
-				}
-			}
-		}
-		list( $outward, $sector ) = self::postcode_parts( $postcode );
-		foreach ( array( $sector, $outward ) as $pc ) {
-			foreach ( $rules as $r ) {
-				if ( '' !== $pc && in_array( $pc, $r['postcodes'], true ) ) {
-					return array( $r['region'], 'rule:postcode' );
-				}
-			}
-		}
-		return array( '', '' );
 	}
 
 	/* =====================================================================
@@ -673,12 +576,7 @@ final class PH_Smart_Location {
 	}
 
 	private function needs_sql() {
-		$s     = self::settings();
-		$needs = array( $this->suburb_empty_sql() );
-		if ( $s['region_enabled'] ) {
-			$needs[] = $this->meta_empty_sql( $s['region_key'] );
-		}
-		return '(' . implode( ' OR ', $needs ) . ')';
+		return '(' . $this->suburb_empty_sql() . ')';
 	}
 
 	private function scope_sql() {
@@ -706,16 +604,12 @@ final class PH_Smart_Location {
 
 	private function counts() {
 		global $wpdb;
-		$s     = self::settings();
 		$scope = $this->scope_sql();
 		$out   = array(
 			'total'          => (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} p WHERE {$scope}" ), // phpcs:ignore
 			'missing_suburb' => (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} p WHERE {$scope} AND " . $this->suburb_empty_sql() ), // phpcs:ignore
 			'to_process'     => (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} p WHERE {$scope} AND " . $this->needs_sql() . ' AND ' . $this->pending_sql() ), // phpcs:ignore
 		);
-		if ( $s['region_enabled'] ) {
-			$out['missing_region'] = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} p WHERE {$scope} AND " . $this->meta_empty_sql( $s['region_key'] ) ); // phpcs:ignore
-		}
 		foreach ( (array) $wpdb->get_results( $wpdb->prepare( "SELECT meta_value AS status, COUNT(*) AS n FROM {$wpdb->postmeta} WHERE meta_key = %s GROUP BY meta_value", self::META_STATUS ) ) as $row ) {
 			$out[ 'status_' . $row->status ] = (int) $row->n;
 		}
@@ -785,7 +679,7 @@ final class PH_Smart_Location {
 		if ( get_post_field( 'post_date_gmt', $post_id ) < get_option( 'phsl_activated_at', '' ) ) {
 			return; // existing properties are processed from the Overview tab
 		}
-		if ( ! $this->suburb_is_empty( $post_id ) && ! ( $s['region_enabled'] && ! self::meta_values( $post_id, $s['region_key'] ) ) ) {
+		if ( ! $this->suburb_is_empty( $post_id ) ) {
 			return;
 		}
 
@@ -816,7 +710,7 @@ final class PH_Smart_Location {
 	 * =================================================================== */
 
 	/**
-	 * Work out (and, in assign mode, save) the suburb/region for one property.
+	 * Work out (and, in assign mode, save) the suburb for one property.
 	 *
 	 * @param bool $dry_run Save and record nothing (test tool).
 	 * @return array Result (verbose; only ever logged, never stored on the property).
@@ -832,8 +726,6 @@ final class PH_Smart_Location {
 			'src'         => '',
 			'items'       => array(), // Location mode: array( f => OSM field, n => name, t => term id or 0, p => parent for new )
 			'l'           => array_map( 'intval', (array) ( $prev['l'] ?? array() ) ),
-			'region'      => '',
-			'region_src'  => '',
 			'o'           => null,
 			'a'           => null,
 			'n'           => (int) ( $prev['n'] ?? 0 ),
@@ -841,24 +733,10 @@ final class PH_Smart_Location {
 			'context'     => array(),
 		);
 
-		$need_suburb = $this->suburb_is_empty( $pid );
-		$need_region = $s['region_enabled'] && ! self::meta_values( $pid, $s['region_key'] );
-		if ( ! $need_suburb && ! $need_region ) {
+		if ( ! $this->suburb_is_empty( $pid ) ) {
 			$r['status']  = 'skipped';
 			$r['notes'][] = 'nothing to fill in';
 			return $this->finish( $r, $dry_run );
-		}
-
-		// Suburb already known and only the region is missing: the rules may answer without any lookup.
-		if ( ! $need_suburb && $need_region ) {
-			list( $r['region'], $r['region_src'] ) = self::region_from_rules( $this->current_suburb_names( $pid ), $postcode );
-			if ( '' !== $r['region'] ) {
-				$r['status'] = 'assign' === $s['mode'] ? 'assigned' : 'suggested';
-				if ( ! $dry_run && 'assigned' === $r['status'] ) {
-					$this->save_values( $pid, $r );
-				}
-				return $this->finish( $r, $dry_run );
-			}
 		}
 
 		/* 1. OpenStreetMap */
@@ -886,35 +764,26 @@ final class PH_Smart_Location {
 		}
 
 		// Every ticked OSM area that is present (suburb, neighbourhood, quarter).
-		if ( $need_suburb ) {
-			foreach ( $s['osm_fields'] as $f ) {
-				if ( ! empty( $address[ $f ] ) && is_string( $address[ $f ] ) ) {
-					$r['items'][] = array( 'f' => $f, 'n' => trim( $address[ $f ] ) );
-				}
+		foreach ( $s['osm_fields'] as $f ) {
+			if ( ! empty( $address[ $f ] ) && is_string( $address[ $f ] ) ) {
+				$r['items'][] = array( 'f' => $f, 'n' => trim( $address[ $f ] ) );
 			}
-			if ( $r['items'] ) {
-				$r['suburb'] = $r['items'][0]['n'];
-				$r['src']    = 'osm:' . $r['items'][0]['f'];
-			}
+		}
+		if ( $r['items'] ) {
+			$r['suburb'] = $r['items'][0]['n'];
+			$r['src']    = 'osm:' . $r['items'][0]['f'];
 		}
 		if ( null === $r['o'] ) {
 			$r['o'] = $r['items'] ? 1 : 0;
 		}
 
-		$suburbs_for_region = $need_suburb ? wp_list_pluck( $r['items'], 'n' ) : $this->current_suburb_names( $pid );
-		if ( $need_region ) {
-			list( $r['region'], $r['region_src'] ) = self::region_from_rules( $suburbs_for_region, $postcode );
-		}
-
-		/* 2. Claude, for whatever OSM / the rules could not answer */
-		$ask_suburb = $need_suburb && '' === $r['suburb'];
-		$ask_region = $need_region && '' === $r['region'] && $s['region_use_claude'] && self::region_values();
-		if ( ( $ask_suburb || $ask_region ) && $s['use_claude'] ) {
+		/* 2. Claude, when OSM had none of the ticked areas */
+		if ( '' === $r['suburb'] && $s['use_claude'] ) {
 			if ( ! self::claude_enabled() ) {
 				$r['a']       = 'nokey';
 				$r['notes'][] = 'Claude skipped: no API key';
 			} else {
-				$c = $this->claude_lookup( $pid, $postcode, $osm, $ask_suburb, $ask_region, $suburbs_for_region );
+				$c = $this->claude_lookup( $pid, $postcode, $osm );
 				if ( is_wp_error( $c ) ) {
 					$r['a']       = 'error';
 					$r['notes'][] = 'Claude: ' . $c->get_error_message();
@@ -928,22 +797,13 @@ final class PH_Smart_Location {
 					$ranks     = array( 'low' => 1, 'medium' => 2, 'high' => 3 );
 					$confident = ( $ranks[ $c['confidence'] ] ?? 0 ) >= $ranks[ $s['claude_min_confidence'] ];
 					$r['a']    = $confident ? 'used' : 'unsure';
-					if ( $ask_suburb && '' !== $c['suburb'] ) {
+					if ( '' !== $c['suburb'] ) {
 						if ( $confident ) {
 							$r['suburb']  = $c['suburb'];
 							$r['src']     = 'claude';
 							$r['items'][] = array( 'f' => 'suburb', 'n' => $c['suburb'] );
 						} else {
 							$r['notes'][] = sprintf( 'Claude suggested "%s" with low confidence (not used)', $c['suburb'] );
-						}
-					}
-					if ( $ask_region ) {
-						if ( 'claude' === $r['src'] ) {
-							list( $r['region'], $r['region_src'] ) = self::region_from_rules( array( $r['suburb'] ), $postcode );
-						}
-						if ( '' === $r['region'] && '' !== $c['region'] && $confident ) {
-							$r['region']     = $c['region'];
-							$r['region_src'] = 'claude';
 						}
 					}
 				}
@@ -969,7 +829,7 @@ final class PH_Smart_Location {
 			}
 		}
 
-		if ( '' === $r['suburb'] && '' === $r['region'] ) {
+		if ( '' === $r['suburb'] ) {
 			// A temporary Claude failure is worth retrying; anything else is final.
 			$r['status'] = 'error' === $r['a'] ? 'retry' : 'not_found';
 			return $this->finish( $r, $dry_run );
@@ -1034,7 +894,7 @@ final class PH_Smart_Location {
 
 	/**
 	 * Save values. Locations are added alongside any already on the property (never removed);
-	 * a custom-field suburb and the region are only written when empty. Creates Locations if needed.
+	 * a custom-field suburb is only written when empty. Creates Locations if needed.
 	 *
 	 * @return true|WP_Error
 	 */
@@ -1075,9 +935,6 @@ final class PH_Smart_Location {
 				$this->vocab = null;
 			}
 		}
-		if ( $s['region_enabled'] && '' !== $r['region'] && ! self::meta_values( $pid, $s['region_key'] ) ) {
-			update_post_meta( $pid, $s['region_key'], $s['region_multiple'] ? array( $r['region'] ) : $r['region'] );
-		}
 		do_action( 'phsl_values_assigned', $pid, $r );
 		return true;
 	}
@@ -1101,9 +958,6 @@ final class PH_Smart_Location {
 			$parts[ count( $parts ) - 1 ] .= ' from ' . ( 'claude' === $r['src'] ? 'Claude' : 'OSM' );
 		} elseif ( '' !== $r['suburb'] ) {
 			$parts[] = sprintf( 'suburb "%s" (%s)', $r['suburb'], $r['src'] );
-		}
-		if ( '' !== $r['region'] ) {
-			$parts[] = sprintf( 'region "%s" (%s)', $r['region'], $r['region_src'] );
 		}
 		$r['message'] = ucfirst( str_replace( '_', ' ', $r['status'] ) ) . ( $parts ? ': ' . implode( '; ', $parts ) : '' ) . ( $r['notes'] ? ' – ' . implode( '; ', $r['notes'] ) : '' );
 		if ( 'retry' === $r['status'] && empty( $r['halt'] ) ) {
@@ -1129,7 +983,6 @@ final class PH_Smart_Location {
 		);
 		if ( 'suggested' === $r['status'] ) {
 			$state['v'] = self::uses_taxonomy() ? $r['items'] : $r['suburb'];
-			$state['r'] = $r['region'];
 		}
 		$this->set_state( $pid, $r['status'], $state );
 
@@ -1238,7 +1091,7 @@ final class PH_Smart_Location {
 	 * Claude
 	 * =================================================================== */
 
-	private function claude_lookup( $pid, $postcode, $osm, $ask_suburb, $ask_region, $known_suburbs ) {
+	private function claude_lookup( $pid, $postcode, $osm ) {
 		$s = self::settings();
 
 		$lines = array( 'Address: ' . $this->address_query( $pid ) );
@@ -1261,29 +1114,15 @@ final class PH_Smart_Location {
 			}
 		}
 		$lines[] = 'OpenStreetMap areas at this location: ' . ( $areas ? implode( ', ', $areas ) : 'none' );
-		if ( ! $ask_suburb && $known_suburbs ) {
-			$lines[] = 'Suburb: ' . implode( ', ', $known_suburbs );
-		}
 
-		$tasks = array();
-		if ( $ask_suburb ) {
-			$tasks[] = 'Identify the suburb: the locally recognised district or area name an estate agent would use for this address (for example "Edgbaston" or "Kings Norton"). Do not give the city, county, a building, a road or a housing development name. OpenStreetMap data may be missing or wrong; use your own knowledge of the area. If you are not reasonably sure, return an empty suburb.';
-		}
+		$tasks   = array();
+		$tasks[] = 'Identify the suburb: the locally recognised district or area name an estate agent would use for this address (for example "Edgbaston" or "Kings Norton"). Do not give the city, county, a building, a road or a housing development name. OpenStreetMap data may be missing or wrong; use your own knowledge of the area. If you are not reasonably sure, return an empty suburb.';
 		$properties = array(
 			'suburb'     => array( 'type' => 'string' ),
-			'region'     => array( 'type' => 'string' ),
 			'confidence' => array( 'type' => 'string', 'enum' => array( 'high', 'medium', 'low' ) ),
 			'reason'     => array( 'type' => 'string' ),
 		);
-		if ( $ask_region ) {
-			$values  = self::region_values();
-			$tasks[] = 'Choose the region for this property. It must be exactly one of: ' . implode( '; ', $values ) . '. Return an empty region if none fits.';
-			if ( trim( $s['region_rules'] ) ) {
-				$tasks[] = "How regions are defined (region = suburbs / postcodes):\n" . trim( $s['region_rules'] );
-			}
-			$properties['region']['enum'] = array_merge( $values, array( '' ) );
-		}
-		$tasks[] = 'Give your confidence and a one-sentence reason. Return an empty string for anything you were not asked for.';
+		$tasks[] = 'Give your confidence and a one-sentence reason.';
 
 		$body = array(
 			'model'         => $s['claude_model'],
@@ -1295,7 +1134,7 @@ final class PH_Smart_Location {
 					'schema' => array(
 						'type'                 => 'object',
 						'properties'           => $properties,
-						'required'             => array( 'suburb', 'region', 'confidence', 'reason' ),
+						'required'             => array( 'suburb', 'confidence', 'reason' ),
 						'additionalProperties' => false,
 					),
 				),
@@ -1330,13 +1169,8 @@ final class PH_Smart_Location {
 		if ( ! is_array( $data ) ) {
 			return new WP_Error( 'claude_bad_output', 'unexpected answer (stop reason: ' . ( $response['stop_reason'] ?? '?' ) . ')' );
 		}
-		$region = trim( (string) ( $data['region'] ?? '' ) );
-		if ( '' !== $region && ! in_array( $region, self::region_values(), true ) ) {
-			$region = '';
-		}
 		return array(
-			'suburb'        => $ask_suburb ? trim( (string) ( $data['suburb'] ?? '' ) ) : '',
-			'region'        => $ask_region ? $region : '',
+			'suburb'        => trim( (string) ( $data['suburb'] ?? '' ) ),
 			'confidence'    => in_array( $data['confidence'] ?? '', array( 'high', 'medium', 'low' ), true ) ? $data['confidence'] : 'low',
 			'reason'        => trim( (string) ( $data['reason'] ?? '' ) ),
 			'model'         => $response['model'] ?? $s['claude_model'],
@@ -1436,7 +1270,6 @@ final class PH_Smart_Location {
 			array(
 				'property'       => get_the_title( $pid ),
 				'current_suburb' => $this->current_suburb_label( $pid ),
-				'current_region' => $s['region_enabled'] ? implode( ', ', self::meta_values( $pid, $s['region_key'] ) ) : '(region disabled)',
 				'note'           => 'Test only: nothing was saved, created or recorded. A property that already has a known suburb / neighbourhood / quarter Location is skipped.',
 				'result'         => $r,
 				'osm_request'    => $this->last_osm,
@@ -1458,7 +1291,6 @@ final class PH_Smart_Location {
 		$r     = array(
 			'items'  => $items,
 			'suburb' => is_array( $v ) ? ( $items ? (string) $items[0]['n'] : '' ) : (string) $v,
-			'region' => (string) ( $state['r'] ?? '' ),
 			'src'    => (string) ( $state['src'] ?? '' ),
 			'l'      => (array) ( $state['l'] ?? array() ),
 		);
@@ -1467,10 +1299,10 @@ final class PH_Smart_Location {
 			$this->log( 'error', 'Apply failed: ' . $saved->get_error_message(), $pid );
 			return false;
 		}
-		unset( $state['v'], $state['r'] );
+		unset( $state['v'] );
 		$state['l'] = $r['l'] ? $r['l'] : null;
 		$this->set_state( $pid, 'assigned', $state );
-		$this->log( 'info', sprintf( 'Assigned (applied by %s): %s%s', wp_get_current_user()->user_login, $items ? implode( ', ', array_map( array( $this, 'term_path' ), wp_list_pluck( $r['items'], 't' ) ) ) : 'suburb "' . $r['suburb'] . '"', '' !== $r['region'] ? '; region "' . $r['region'] . '"' : '' ), $pid );
+		$this->log( 'info', sprintf( 'Assigned (applied by %s): %s', wp_get_current_user()->user_login, $items ? implode( ', ', array_map( array( $this, 'term_path' ), wp_list_pluck( $r['items'], 't' ) ) ) : 'suburb "' . $r['suburb'] . '"' ), $pid );
 		return true;
 	}
 
@@ -1640,14 +1472,10 @@ final class PH_Smart_Location {
 				<?php elseif ( $s['use_claude'] ) : ?>. <span class="phsl-warn">Claude is enabled but there is no API key.</span>
 				<?php else : ?>. Claude is off.<?php endif; ?>
 			</p>
-			<p><strong>Region:</strong> <?php echo $s['region_enabled'] ? esc_html( sprintf( '%s, %d rules%s', $s['region_key'], count( self::region_rules() ), $s['region_use_claude'] && self::claude_enabled() ? ', then Claude' : '' ) ) : 'off'; ?></p>
 			<p><strong>New properties:</strong> <?php echo esc_html( $when ? 'processed ' . implode( ' and ', $when ) : 'not processed automatically' ); ?>.</p>
 			<table class="widefat phsl-counts"><tbody>
 				<tr><td>Properties in scope</td><td class="num"><?php echo esc_html( number_format_i18n( $c['total'] ) ); ?></td></tr>
 				<tr><td>Without a <?php echo esc_html( self::uses_taxonomy() ? 'suburb / neighbourhood / quarter Location' : 'suburb' ); ?></td><td class="num"><?php echo esc_html( number_format_i18n( $c['missing_suburb'] ) ); ?></td></tr>
-				<?php if ( isset( $c['missing_region'] ) ) : ?>
-					<tr><td>Without a region</td><td class="num"><?php echo esc_html( number_format_i18n( $c['missing_region'] ) ); ?></td></tr>
-				<?php endif; ?>
 				<tr><td>Waiting to be processed</td><td class="num" id="phsl-to-process"><?php echo esc_html( number_format_i18n( $c['to_process'] ) ); ?></td></tr>
 				<?php foreach ( array( 'suggested' => 'Suggestions awaiting review', 'assigned' => 'Assigned', 'not_found' => 'Nothing found', 'retry' => 'Waiting to retry', 'error' => 'Errors' ) as $k => $label ) : ?>
 					<tr><td><a href="<?php echo esc_url( self::page_url( 'results', array( 'status' => $k ) ) ); ?>"><?php echo esc_html( $label ); ?></a></td><td class="num"><?php echo esc_html( number_format_i18n( $c[ 'status_' . $k ] ?? 0 ) ); ?></td></tr>
@@ -1657,7 +1485,7 @@ final class PH_Smart_Location {
 
 		<div class="phsl-card">
 			<h2>Process existing properties</h2>
-			<p class="description">Works through properties without a <?php echo esc_html( self::uses_taxonomy() ? 'known suburb / neighbourhood / quarter Location' : 'suburb' ); ?><?php echo $s['region_enabled'] ? ' or region' : ''; ?>, newest first, within OpenStreetMap’s limit of one request per second. Stop and resume at any time.</p>
+			<p class="description">Works through properties without a <?php echo esc_html( self::uses_taxonomy() ? 'known suburb / neighbourhood / quarter Location' : 'suburb' ); ?>, newest first, within OpenStreetMap’s limit of one request per second. Stop and resume at any time.</p>
 			<div class="phsl-controls">
 				<label>Run for <input type="number" id="phsl-minutes" min="1" max="240" value="10" class="small-text"> minutes</label>
 				<label>or at most <input type="number" id="phsl-max" min="1" value="100" class="small-text"> properties</label>
@@ -1750,7 +1578,6 @@ final class PH_Smart_Location {
 			<thead><tr>
 				<th>Property</th>
 				<th><?php echo esc_html( self::uses_taxonomy() ? 'Location' : 'Suburb' ); ?></th>
-				<?php echo $s['region_enabled'] ? '<th>Region</th>' : ''; ?>
 				<th>OSM</th><th>Claude</th><th>Status</th><th></th>
 			</tr></thead>
 			<tbody>
@@ -1773,11 +1600,9 @@ final class PH_Smart_Location {
 					} else {
 						$sub_lb = (string) $v;
 					}
-					$region = (string) ( $st['r'] ?? '' );
 				} else {
 					$sub_lb = $this->current_suburb_label( (int) $row->ID );
 					$is_new = false;
-					$region = $s['region_enabled'] ? implode( ', ', self::meta_values( (int) $row->ID, $s['region_key'] ) ) : '';
 				}
 				?>
 				<tr>
@@ -1785,7 +1610,6 @@ final class PH_Smart_Location {
 						<?php if ( ! empty( $st['t'] ) ) : ?><br><small><?php echo esc_html( wp_date( 'j M Y H:i', $st['t'] ) ); ?></small><?php endif; ?></td>
 					<td><?php echo '' !== $sub_lb ? esc_html( $sub_lb ) : '–'; ?>
 						<?php if ( ! empty( $st['src'] ) ) : ?><br><small><?php echo esc_html( $st['src'] ); ?><?php echo $is_new ? ' · <strong>creates new Location</strong>' : ''; ?></small><?php endif; ?></td>
-					<?php if ( $s['region_enabled'] ) : ?><td><?php echo '' !== $region ? esc_html( $region ) : '–'; ?></td><?php endif; ?>
 					<td><?php echo esc_html( isset( $st['o'] ) ? ( $osm_label[ (string) $st['o'] ] ?? $st['o'] ) : '–' ); ?></td>
 					<td><?php echo esc_html( isset( $st['a'] ) ? ( $claude_label[ $st['a'] ] ?? $st['a'] ) : '–' ); ?></td>
 					<td><span class="phsl-badge phsl-<?php echo esc_attr( $row->status ); ?>"><?php echo esc_html( $labels[ $row->status ] ?? $row->status ); ?></span></td>
@@ -1899,7 +1723,7 @@ final class PH_Smart_Location {
 					<td>
 						<label class="phsl-block"><input type="radio" name="mode" value="suggest" <?php checked( $s['mode'], 'suggest' ); ?>> <strong>Suggest only</strong>: list values on the Results tab for review; nothing is saved or created.</label>
 						<label class="phsl-block"><input type="radio" name="mode" value="assign" <?php checked( $s['mode'], 'assign' ); ?>> <strong>Assign automatically</strong>: save values to the property (creating Locations if needed).</label>
-						<p class="description">Locations are only ever <strong>added</strong>, never removed. A property that already has a known suburb, neighbourhood or quarter Location (for example matched from its address during import) is left alone with no lookups. The region and a custom-field suburb are only filled when empty.</p>
+						<p class="description">Locations are only ever <strong>added</strong>, never removed. A property that already has a known suburb, neighbourhood or quarter Location (for example matched from its address during import) is left alone with no lookups. A custom-field suburb is only filled when empty.</p>
 					</td>
 				</tr>
 				<tr>
@@ -1988,33 +1812,6 @@ final class PH_Smart_Location {
 							<option value="<?php echo esc_attr( $k ); ?>" <?php selected( $s['claude_min_confidence'], $k ); ?>><?php echo esc_html( $l ); ?></option>
 						<?php endforeach; ?>
 					</select></td>
-				</tr>
-			</table>
-
-			<h2>Region</h2>
-			<table class="form-table" role="presentation">
-				<tr>
-					<th scope="row">Enable</th>
-					<td><label><input type="checkbox" name="region_enabled" value="1" <?php checked( $s['region_enabled'] ); ?>> Also fill in a region custom field</label></td>
-				</tr>
-				<tr>
-					<th scope="row"><label for="phsl-region-key">Region field</label></th>
-					<td><input type="text" id="phsl-region-key" name="region_key" class="regular-text code" value="<?php echo esc_attr( $s['region_key'] ); ?>">
-						<label class="phsl-block"><input type="checkbox" name="region_multiple" value="1" <?php checked( $s['region_multiple'] ); ?>> Multi-select field (stored as a list)</label></td>
-				</tr>
-				<tr>
-					<th scope="row"><label for="phsl-region-values">Allowed regions</label></th>
-					<td><textarea id="phsl-region-values" name="region_values" rows="7" class="large-text code"><?php echo esc_textarea( $s['region_values'] ); ?></textarea>
-						<p class="description">One per line, spelled exactly as the field’s options.</p></td>
-				</tr>
-				<tr>
-					<th scope="row"><label for="phsl-region-rules">Rules</label></th>
-					<td><textarea id="phsl-region-rules" name="region_rules" rows="8" class="large-text code" placeholder="Birmingham South = Edgbaston, Selly Oak, Kings Norton, B30, B31&#10;Birmingham Central = Jewellery Quarter, Birmingham City Centre, B1, B2, B3, B4, B5"><?php echo esc_textarea( $s['region_rules'] ); ?></textarea>
-						<p class="description">One region per line: <code>Region = suburb, suburb, postcode…</code>. Postcodes can be districts (<code>B30</code>) or sectors (<code>B15 2</code>). Suburbs are matched first (including parent Locations), then postcode sector, then district.</p></td>
-				</tr>
-				<tr>
-					<th scope="row">Claude for regions</th>
-					<td><label><input type="checkbox" name="region_use_claude" value="1" <?php checked( $s['region_use_claude'] ); ?>> Ask Claude to choose from the allowed regions when no rule matches</label></td>
 				</tr>
 			</table>
 
