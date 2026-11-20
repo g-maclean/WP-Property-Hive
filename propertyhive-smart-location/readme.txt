@@ -1,4 +1,4 @@
-=== Property Hive Smart Location 4.0 ===
+=== Property Hive Smart Location 1.2 ===
 
 Assigns each property's suburb as a Property Hive Location, creating new suburbs as TOP-LEVEL
 Locations for the site to arrange in whatever hierarchy it wants. Optionally fills neighbourhood
@@ -19,7 +19,7 @@ A custom field can be used for the suburb instead of Locations.
 Known suburbs
 The option `phsl_suburb_terms` lists the Location ids Smart Location has matched or created as
 suburbs. Moving them around the hierarchy doesn't matter. Deleted Locations are removed from it.
-Upgrading from 3.x seeds it from the suburbs already assigned.
+Upgrading from an earlier build seeds it from the suburbs already assigned.
 
 Modes: Suggest only (default; review on the Results tab, Apply / Apply all) or Assign automatically.
 

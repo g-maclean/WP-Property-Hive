@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Property Hive Smart Location
  * Description: Assigns each property's suburb as a Location (creating new suburbs at the top level for you to arrange), and optionally fills neighbourhood and quarter custom fields, using OpenStreetMap with Claude AI as a fallback.
- * Version: 4.0.0
+ * Version: 1.2
  * Author: Property Hive
  * Requires at least: 5.6
  * Requires PHP: 7.2
@@ -17,7 +17,7 @@ require_once __DIR__ . '/includes/class-phsl-logger.php';
 
 final class PH_Smart_Location {
 
-	const VERSION       = '4.0.0';
+	const VERSION       = '1.2';
 	const DB_VERSION    = '4';
 	const OPTION        = 'phsl_settings';
 	const PAGE_SLUG     = 'ph-smart-location';
@@ -128,7 +128,7 @@ final class PH_Smart_Location {
 		}
 		if ( $version && version_compare( $version, '4', '<' ) ) {
 			// 2.x kept an option of suburb/neighbourhood/quarter Locations; 3.x identified suburbs by depth.
-			// 4.0 keeps one list of suburb Locations: seed it from the 2.x suburbs and everything already assigned.
+			// Now one list of suburb Locations: seed it from the 2.x suburbs and everything already assigned.
 			$ids   = array();
 			$types = get_option( 'phsl_location_types', array() );
 			if ( ! empty( $types['suburb'] ) ) {
@@ -146,7 +146,7 @@ final class PH_Smart_Location {
 			$n = $this->requeue( function ( $status ) {
 				return 'review' === $status;
 			} );
-			$this->log( 'info', sprintf( 'Upgraded to 4.0: new suburbs are created at the top level; %d known suburb Locations; %d properties awaiting a region re-queued.', count( self::suburb_term_ids() ), $n ) );
+			$this->log( 'info', sprintf( 'Upgraded data: new suburbs are created at the top level; %d known suburb Locations; %d properties awaiting a region re-queued.', count( self::suburb_term_ids() ), $n ) );
 		}
 		if ( self::DB_VERSION !== $version ) {
 			update_option( 'phsl_db_version', self::DB_VERSION, false );
