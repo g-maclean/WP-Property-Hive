@@ -7,7 +7,7 @@ How it decides
 1. Skip: the property already has a Location known to be a suburb, neighbourhood or quarter
    (e.g. matched from its address by the import add-on). No lookups.
 2. OpenStreetMap reverse lookup (coordinates; address search if none), max 1 request/second.
-   Every ticked area (suburb, neighbourhood, quarter - all ticked by default) is assigned.
+   Every ticked area (suburb, neighbourhood, quarter - only suburb ticked by default) is assigned.
 3. If OSM has none of them, Claude is asked for the suburb (answers below the minimum
    confidence are not used).
 Matching is by name ignoring case/punctuation. New suburbs are created under the OSM town/city

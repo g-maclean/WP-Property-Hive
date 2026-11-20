@@ -161,7 +161,7 @@ final class PH_Smart_Location {
 			'suburb_key'            => '_suburb',
 			'create_terms'          => 1,
 			'new_term_parent'       => 'auto',
-			'osm_fields'            => array( 'suburb', 'neighbourhood', 'quarter' ),
+			'osm_fields'            => array( 'suburb' ),
 			'use_claude'            => 1,
 			'claude_model'          => 'claude-opus-5-5',
 			'claude_api_key'        => '',
