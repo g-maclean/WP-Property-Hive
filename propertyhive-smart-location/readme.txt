@@ -1,35 +1,38 @@
-=== Property Hive Smart Location 2.1 ===
+=== Property Hive Smart Location 3.0 ===
 
-Assigns each property's suburb / neighbourhood / quarter as Property Hive Locations, creating
-Locations that don't exist yet. Wider areas (e.g. a "Birmingham South" grouping) are handled by
-Location parents: put the suburb Locations under the right parent and searches on the parent
-include them.
+Assigns each property's suburb as a Location in a fixed City › Region › Suburb structure
+(levels 1, 2 and 3 - the depth Property Hive fully supports), and optionally fills neighbourhood
+and quarter custom fields.
 
 How it decides
-1. Skip: the property already has a Location known to be a suburb, neighbourhood or quarter
-   (e.g. matched from its address by the import add-on). No lookups.
+1. Skip: the property already has a suburb, i.e. any level-3 Location (for example matched from
+   its address by the import add-on). No lookups.
 2. OpenStreetMap reverse lookup (coordinates; address search if none), max 1 request/second.
-   Every ticked area (suburb, neighbourhood, quarter - only suburb ticked by default) is assigned.
-3. If OSM has none of them, Claude is asked for the suburb (answers below the minimum
-   confidence are not used).
-Matching is by name ignoring case/punctuation. New suburbs are created under the OSM town/city
-Location (or as configured); new neighbourhoods/quarters under their suburb.
-Locations are only ever ADDED, never removed. A custom field can be used instead of Locations
-(only filled when empty).
+   The suburb is OSM's "suburb"; if OSM has none, Claude is asked.
+3. Existing suburbs (level-3 Locations) are matched by name, ignoring case/punctuation, preferring
+   one in the property's city. A new suburb is created under a REGION of the property's CITY:
+     city   = OSM city/town/village/municipality/county matched to a level-1 Location,
+              else the "Default city" setting, else the only city
+     region = the city's only region, else the one Claude chooses (it is given the regions and
+              the suburbs already in each), else the "Fallback region" setting,
+              else the property is held as "Needs region" - pick the region on the Results tab
+              and click "Create & assign".
+   Nothing is ever created deeper than level 3. Locations are only ever ADDED, never removed.
+4. Neighbourhood / quarter (optional, off by default): OSM's values are saved to their own custom
+   fields (default _neighbourhood / _quarter), only when empty. OSM only, no Claude.
+A custom field can be used for the suburb instead of Locations.
 
-Known Location types
-The option `phsl_location_types` = array( 'suburb' => ids, 'neighbourhood' => ids, 'quarter' => ids )
-grows as properties are looked up and is what step 1 checks against.
+Modes: Suggest only (default; review on the Results tab, Apply / Apply all) or Assign automatically.
 
 Imports
 Runs after each property via propertyhive_property_imported (Property Import add-on, all formats)
 and propertyhive_property_imported_property_sales_online_json. The Property Import add-on's address
-matching REPLACES a property's Locations on every run (and clears them when nothing matches), so
-Locations Smart Location added are re-applied straight afterwards from the property's saved list -
-no lookups. New lookups: max 20 / 60 seconds per import run, the rest via the 10-minute cron.
+matching REPLACES a property's Locations on every run, so suburbs Smart Location added are
+re-applied straight afterwards from the property's saved list - no lookups. New lookups: max
+20 / 60 seconds per import run, the rest via the 10-minute cron (new properties only).
 
 Post meta (kept minimal)
-_phsl_status  assigned | suggested | not_found | retry | error | skipped
+_phsl_status  assigned | suggested | review | not_found | retry | error | skipped
 _phsl         flags: t (time), o (OSM result), a (Claude: used/unsure/error/nokey), src,
               l (Location ids assigned, for re-applying), n (retry count), v (pending suggestion)
 
@@ -38,4 +41,4 @@ Monthly files in wp-content/uploads/ph-smart-location-logs/ (protected; random f
 last 6 months kept. Viewable/filterable/downloadable on the Log tab, including per property.
 
 Claude API key: define( 'PHSL_ANTHROPIC_API_KEY', 'sk-ant-...' ); in wp-config.php (or Settings).
-Re-queuing after adding a key happens automatically for properties skipped for lack of one.
+Adding a key automatically re-queues properties that were skipped for lack of one.
