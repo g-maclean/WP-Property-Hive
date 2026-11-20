@@ -18,3 +18,4 @@
 .gitignore export-ignore
 .wp-env.json export-ignore
 propertyhive-osm-location-checker export-ignore
+propertyhive-smart-location export-ignore
