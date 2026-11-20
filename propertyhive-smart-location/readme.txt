@@ -17,7 +17,11 @@ Modes
 - Assign automatically: values are saved straight to the property.
 
 When it runs
-- New properties (created after activation): every 10 minutes via WP-Cron.
+- Straight after each property is imported (Property Import add-on, all formats, via
+  propertyhive_property_imported; Property Sales Online add-on via
+  propertyhive_property_imported_property_sales_online_json). Max 20 lookups / 60 seconds per
+  import run (filter: phsl_import_limits); extra hooks can be added with the phsl_import_hooks filter.
+- New properties (created after activation): every 10 minutes via WP-Cron, as a catch-all.
 - Existing properties: Overview tab > Process existing properties (time/count limited, resumable).
 - Test a property: Overview tab, nothing saved.
 

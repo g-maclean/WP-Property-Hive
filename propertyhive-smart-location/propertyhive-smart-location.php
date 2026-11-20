@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Property Hive Smart Location
  * Description: Automatically fills in a property's suburb (and optionally region) using OpenStreetMap, falling back to Claude AI when OpenStreetMap has no answer. Only empty fields are ever filled.
- * Version: 1.0.0
+ * Version: 1.1.0
  * Author: Property Hive
  * Requires at least: 5.6
  * Requires PHP: 7.2
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 final class PH_Smart_Location {
 
-	const VERSION       = '1.0.0';
+	const VERSION       = '1.1.0';
 	const DB_VERSION    = '1';
 	const OPTION        = 'phsl_settings';
 	const PAGE_SLUG     = 'ph-smart-location';
@@ -61,6 +61,11 @@ final class PH_Smart_Location {
 
 		add_filter( 'cron_schedules', array( __CLASS__, 'cron_schedules' ) );
 		add_action( self::CRON_HOOK, array( $this, 'cron_run' ) );
+
+		// Property Hive Property Import add-on (every format) and the Property Sales Online add-on.
+		foreach ( (array) apply_filters( 'phsl_import_hooks', array( 'propertyhive_property_imported', 'propertyhive_property_imported_property_sales_online_json' ) ) as $hook ) {
+			add_action( $hook, array( $this, 'on_imported' ), 20, 1 );
+		}
 
 		add_action( 'admin_init', array( $this, 'maybe_upgrade' ) );
 		add_action( 'admin_menu', array( $this, 'admin_menu' ), 99 );
@@ -134,6 +139,7 @@ final class PH_Smart_Location {
 		return array(
 			'mode'                  => 'suggest',
 			'auto_new'              => 1,
+			'on_import'             => 1,
 			'suburb_key'            => '_suburb',
 			'osm_fields'            => array( 'suburb' ),
 			'use_claude'            => 1,
@@ -205,6 +211,7 @@ final class PH_Smart_Location {
 		$new = array(
 			'mode'                  => 'assign' === ( $p['mode'] ?? '' ) ? 'assign' : 'suggest',
 			'auto_new'              => empty( $p['auto_new'] ) ? 0 : 1,
+			'on_import'             => empty( $p['on_import'] ) ? 0 : 1,
 			'suburb_key'            => self::sanitize_meta_key( $p['suburb_key'] ?? '_suburb', '_suburb' ),
 			'osm_fields'            => array_values( array_intersect( self::$osm_choices, (array) ( $p['osm_fields'] ?? array() ) ) ),
 			'use_claude'            => empty( $p['use_claude'] ) ? 0 : 1,
@@ -459,6 +466,56 @@ final class PH_Smart_Location {
 				if ( ! empty( $r['halt'] ) || time() - $started > 45 ) {
 					break;
 				}
+			}
+		} finally {
+			$this->release_lock();
+		}
+	}
+
+	/**
+	 * Runs straight after an import add-on has saved a property.
+	 *
+	 * Cheap checks first so updates to properties that already have a suburb cost nothing.
+	 * Limited per import run so a big import isn't slowed down; anything left over is
+	 * picked up by the 10-minute scheduled check.
+	 */
+	public function on_imported( $post_id ) {
+		static $seen = array(), $done = 0, $started = 0, $deferred = 0, $halted = false;
+
+		$post_id = (int) $post_id;
+		$s       = self::settings();
+		if ( ! $s['on_import'] || $halted || isset( $seen[ $post_id ] ) || 'property' !== get_post_type( $post_id ) ) {
+			return;
+		}
+		$seen[ $post_id ] = true;
+
+		if ( get_post_meta( $post_id, self::META_ATTEMPTED, true ) || ! in_array( get_post_status( $post_id ), $s['statuses'], true ) ) {
+			return;
+		}
+		if ( get_post_field( 'post_date_gmt', $post_id ) < get_option( 'phsl_activated_at', '' ) ) {
+			return; // existing properties are processed from the Overview tab, not by imports
+		}
+		$need = ! self::meta_values( $post_id, $s['suburb_key'] ) || ( $s['region_enabled'] && ! self::meta_values( $post_id, $s['region_key'] ) );
+		if ( ! $need ) {
+			return;
+		}
+
+		$started = $started ? $started : time();
+		$limits  = (array) apply_filters( 'phsl_import_limits', array( 'properties' => 20, 'seconds' => 60 ) );
+		if ( $done >= $limits['properties'] || time() - $started > $limits['seconds'] ) {
+			if ( 0 === $deferred++ ) {
+				$this->log( 'info', 'Import limit reached for this run; remaining imported properties will be handled by the scheduled check.' );
+			}
+			return;
+		}
+		if ( ! $this->acquire_lock() ) {
+			return; // another run is busy; the scheduled check will pick this property up
+		}
+		try {
+			$done++;
+			$r = $this->process_property( $post_id );
+			if ( ! empty( $r['halt'] ) ) {
+				$halted = true;
 			}
 		} finally {
 			$this->release_lock();
@@ -1181,7 +1238,17 @@ final class PH_Smart_Location {
 				<?php endif; ?>
 			</p>
 			<p><strong>Region:</strong> <?php echo $s['region_enabled'] ? esc_html( sprintf( 'enabled (%s), %d rules%s', $s['region_key'], count( self::region_rules() ), $s['region_use_claude'] && self::claude_enabled() ? ', Claude for anything the rules don’t cover' : '' ) ) : 'disabled'; ?></p>
-			<p><strong>New properties:</strong> <?php echo $s['auto_new'] ? 'processed automatically every 10 minutes' : 'not processed automatically'; ?>.</p>
+			<p><strong>New properties:</strong>
+				<?php
+				$when = array();
+				if ( $s['on_import'] ) {
+					$when[] = 'straight after each import';
+				}
+				if ( $s['auto_new'] ) {
+					$when[] = 'every 10 minutes';
+				}
+				echo esc_html( $when ? 'processed ' . implode( ' and ', $when ) : 'not processed automatically' );
+				?>.</p>
 			<table class="widefat phsl-counts">
 				<tbody>
 					<tr><td>Properties in scope</td><td class="num"><?php echo esc_html( number_format_i18n( $c['total'] ) ); ?></td></tr>
@@ -1374,8 +1441,9 @@ final class PH_Smart_Location {
 				</tr>
 				<tr>
 					<th scope="row">New properties</th>
-					<td><label><input type="checkbox" name="auto_new" value="1" <?php checked( $s['auto_new'] ); ?>> Automatically process properties added from now on (checked every 10 minutes)</label>
-						<p class="description">Existing properties are only processed when you run them from the Overview tab.</p></td>
+					<td><label class="phsl-block"><input type="checkbox" name="on_import" value="1" <?php checked( $s['on_import'] ); ?>> Process each property straight after it is imported (Property Import / Property Sales Online add-ons). Up to 20 lookups per import run; the rest are picked up by the scheduled check.</label>
+						<label class="phsl-block"><input type="checkbox" name="auto_new" value="1" <?php checked( $s['auto_new'] ); ?>> Check for unprocessed new properties every 10 minutes (catches anything added by hand or left over from an import)</label>
+						<p class="description">Both only apply to properties added since Smart Location was activated. Existing properties are only processed when you run them from the Overview tab.</p></td>
 				</tr>
 				<tr>
 					<th scope="row">Properties</th>
