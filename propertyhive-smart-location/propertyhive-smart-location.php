@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Property Hive Smart Location
- * Description: Assigns each property's suburb as a Location in a City › Region › Suburb structure (creating new suburbs under the right region), and optionally fills neighbourhood and quarter custom fields, using OpenStreetMap with Claude AI as a fallback.
- * Version: 3.0.0
+ * Description: Assigns each property's suburb as a Location (creating new suburbs at the top level for you to arrange), and optionally fills neighbourhood and quarter custom fields, using OpenStreetMap with Claude AI as a fallback.
+ * Version: 4.0.0
  * Author: Property Hive
  * Requires at least: 5.6
  * Requires PHP: 7.2
@@ -17,8 +17,8 @@ require_once __DIR__ . '/includes/class-phsl-logger.php';
 
 final class PH_Smart_Location {
 
-	const VERSION       = '3.0.0';
-	const DB_VERSION    = '3';
+	const VERSION       = '4.0.0';
+	const DB_VERSION    = '4';
 	const OPTION        = 'phsl_settings';
 	const PAGE_SLUG     = 'ph-smart-location';
 	const NONCE         = 'phsl_nonce';
@@ -28,15 +28,10 @@ final class PH_Smart_Location {
 	const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 	const API_VERSION   = '2026-10-21';
 
-	/** Location levels: 1 = city, 2 = region, 3 = suburb. */
-	const DEPTH_CITY   = 1;
-	const DEPTH_REGION = 2;
-	const DEPTH_SUBURB = 3;
-
 	/**
 	 * The only two post meta keys the plugin writes.
 	 *
-	 * _phsl_status: assigned | suggested | review | not_found | error | skipped | retry
+	 * _phsl_status: assigned | suggested | not_found | error | skipped | retry
 	 * _phsl:        small array of flags:
 	 *   t    unix time of the last attempt
 	 *   o    OpenStreetMap: 1 = suburb found, 0 = looked up, no suburb, x = request failed
@@ -44,15 +39,16 @@ final class PH_Smart_Location {
 	 *   src  where the suburb came from (osm:suburb, claude)
 	 *   l    Location term ids Smart Location assigned (re-applied if an import removes them)
 	 *   n    transient-failure count (while status is "retry")
-	 *   v    pending suggestion / review: array( n => suburb, t => existing term id or 0,
-	 *        p => region term id for a new suburb, c => city term id, nb => neighbourhood, q => quarter )
+	 *   v    pending suggestion: array( n => suburb, t => existing term id or 0 (new), nb => neighbourhood, q => quarter )
 	 * Everything else goes to the log file.
+	 *
+	 * The option phsl_suburb_terms lists the Location ids known to be suburbs (matched or created by
+	 * Smart Location). A property that already has one of them needs no lookup. Where Locations sit in
+	 * the hierarchy is entirely up to the site: new suburbs are created at the top level.
 	 */
 	const META_STATUS = '_phsl_status';
 	const META_STATE  = '_phsl';
-
-	/** OSM fields that may identify the city (a level-1 Location), in order. */
-	public static $city_fields = array( 'city', 'town', 'village', 'municipality', 'county' );
+	const SUBURBS_OPTION = 'phsl_suburb_terms';
 
 	/** OSM area fields passed to Claude as context and logged. */
 	public static $osm_context_fields = array( 'neighbourhood', 'suburb', 'quarter', 'residential', 'hamlet', 'village', 'borough', 'city_district', 'town', 'city', 'county' );
@@ -68,7 +64,6 @@ final class PH_Smart_Location {
 	private $vocab      = null;
 	private $terms      = null; // term_id => WP_Term
 	private $term_index = null; // normalised name => term ids
-	private $depths     = null; // term_id => depth (1 = top level)
 	private $last_osm   = array();
 
 	public static function instance() {
@@ -89,6 +84,8 @@ final class PH_Smart_Location {
 		foreach ( (array) apply_filters( 'phsl_import_hooks', array( 'propertyhive_property_imported', 'propertyhive_property_imported_property_sales_online_json' ) ) as $hook ) {
 			add_action( $hook, array( $this, 'on_imported' ), 20, 1 );
 		}
+
+		add_action( 'delete_term', array( $this, 'on_delete_term' ), 10, 3 );
 
 		add_action( 'admin_init', array( $this, 'maybe_upgrade' ) );
 		add_action( 'admin_menu', array( $this, 'admin_menu' ), 99 );
@@ -129,10 +126,27 @@ final class PH_Smart_Location {
 			$wpdb->query( "DROP TABLE IF EXISTS {$wpdb->prefix}phsl_log" ); // phpcs:ignore
 			$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->postmeta} WHERE meta_key IN (%s, %s, %s, %s)", '_phsl_status', '_phsl_result', '_phsl_attempted', '_phsl_tries' ) );
 		}
-		if ( $version && version_compare( $version, '3', '<' ) ) {
-			// 2.x tracked suburb/neighbourhood/quarter Locations in an option; suburbs are now simply level-3 Locations.
+		if ( $version && version_compare( $version, '4', '<' ) ) {
+			// 2.x kept an option of suburb/neighbourhood/quarter Locations; 3.x identified suburbs by depth.
+			// 4.0 keeps one list of suburb Locations: seed it from the 2.x suburbs and everything already assigned.
+			$ids   = array();
+			$types = get_option( 'phsl_location_types', array() );
+			if ( ! empty( $types['suburb'] ) ) {
+				$ids = array_map( 'intval', (array) $types['suburb'] );
+			}
+			foreach ( $wpdb->get_col( $wpdb->prepare( "SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_key = %s", self::META_STATE ) ) as $raw ) {
+				$state = maybe_unserialize( $raw );
+				if ( is_array( $state ) && ! empty( $state['l'] ) ) {
+					$ids = array_merge( $ids, array_map( 'intval', (array) $state['l'] ) );
+				}
+			}
 			delete_option( 'phsl_location_types' );
-			$this->log( 'info', 'Upgraded to 3.0: Locations are now City › Region › Suburb; neighbourhood/quarter go to custom fields.' );
+			$this->add_suburb_terms( $ids );
+			// 3.x "needs region" reviews no longer exist: process those properties again.
+			$n = $this->requeue( function ( $status ) {
+				return 'review' === $status;
+			} );
+			$this->log( 'info', sprintf( 'Upgraded to 4.0: new suburbs are created at the top level; %d known suburb Locations; %d properties awaiting a region re-queued.', count( self::suburb_term_ids() ), $n ) );
 		}
 		if ( self::DB_VERSION !== $version ) {
 			update_option( 'phsl_db_version', self::DB_VERSION, false );
@@ -160,8 +174,6 @@ final class PH_Smart_Location {
 			'suburb_target'         => 'taxonomy',
 			'suburb_key'            => '_suburb',
 			'create_terms'          => 1,
-			'default_city'          => '',
-			'fallback_region'       => '',
 			'neighbourhood_enabled' => 0,
 			'neighbourhood_key'     => '_neighbourhood',
 			'quarter_enabled'       => 0,
@@ -247,8 +259,6 @@ final class PH_Smart_Location {
 			'suburb_target'         => 'meta' === ( $p['suburb_target'] ?? '' ) ? 'meta' : 'taxonomy',
 			'suburb_key'            => self::sanitize_meta_key( $p['suburb_key'] ?? '_suburb', '_suburb' ),
 			'create_terms'          => empty( $p['create_terms'] ) ? 0 : 1,
-			'default_city'          => absint( $p['default_city'] ?? 0 ) ? (string) absint( $p['default_city'] ) : '',
-			'fallback_region'       => absint( $p['fallback_region'] ?? 0 ) ? (string) absint( $p['fallback_region'] ) : '',
 			'neighbourhood_enabled' => empty( $p['neighbourhood_enabled'] ) ? 0 : 1,
 			'neighbourhood_key'     => self::sanitize_meta_key( $p['neighbourhood_key'] ?? '_neighbourhood', '_neighbourhood' ),
 			'quarter_enabled'       => empty( $p['quarter_enabled'] ) ? 0 : 1,
@@ -279,7 +289,7 @@ final class PH_Smart_Location {
 		// Claude has just become available: give it a go on properties that only missed out because there was no key.
 		if ( ! $had_claude && self::claude_enabled() ) {
 			$n = $this->requeue( function ( $status, $state ) {
-				return in_array( $status, array( 'not_found', 'review' ), true ) && 'nokey' === ( $state['a'] ?? '' );
+				return 'not_found' === $status && 'nokey' === ( $state['a'] ?? '' );
 			} );
 			if ( $n ) {
 				$this->log( 'info', sprintf( 'Claude is now configured: re-queued %d properties where Claude had been skipped for lack of an API key.', $n ) );
@@ -338,7 +348,33 @@ final class PH_Smart_Location {
 		return is_numeric( $value ) ? (float) $value : null;
 	}
 
-	/* ---------- Location structure: City (1) › Region (2) › Suburb (3) ---------- */
+	/* ---------- Known suburb Locations (wp_options) ---------- */
+
+	/** @return int[] Location ids known to be suburbs. */
+	public static function suburb_term_ids() {
+		return array_values( array_unique( array_map( 'intval', (array) get_option( self::SUBURBS_OPTION, array() ) ) ) );
+	}
+
+	private function add_suburb_terms( $ids ) {
+		$current = self::suburb_term_ids();
+		$merged  = array_values( array_unique( array_merge( $current, array_filter( array_map( 'intval', (array) $ids ) ) ) ) );
+		if ( count( $merged ) !== count( $current ) ) {
+			update_option( self::SUBURBS_OPTION, $merged, true );
+		}
+	}
+
+	/** Keep the list tidy when a Location is deleted. */
+	public function on_delete_term( $term_id, $tt_id, $taxonomy ) {
+		if ( self::TAXONOMY !== $taxonomy ) {
+			return;
+		}
+		$ids = self::suburb_term_ids();
+		if ( in_array( (int) $term_id, $ids, true ) ) {
+			update_option( self::SUBURBS_OPTION, array_values( array_diff( $ids, array( (int) $term_id ) ) ), true );
+		}
+	}
+
+	/* ---------- Location terms ---------- */
 
 	private function load_terms() {
 		if ( null !== $this->terms ) {
@@ -346,7 +382,6 @@ final class PH_Smart_Location {
 		}
 		$this->terms      = array();
 		$this->term_index = array();
-		$this->depths     = array();
 		$terms            = get_terms( array( 'taxonomy' => self::TAXONOMY, 'hide_empty' => false ) );
 		if ( is_wp_error( $terms ) ) {
 			return;
@@ -354,9 +389,6 @@ final class PH_Smart_Location {
 		foreach ( $terms as $t ) {
 			$this->terms[ (int) $t->term_id ]                  = $t;
 			$this->term_index[ self::normalise( $t->name ) ][] = (int) $t->term_id;
-		}
-		foreach ( array_keys( $this->terms ) as $id ) {
-			$this->depths[ $id ] = 1 + count( $this->term_ancestors( $id ) );
 		}
 		/** Aliases: array( 'name OSM/Claude uses' => term_id ). */
 		foreach ( (array) apply_filters( 'phsl_location_aliases', array() ) as $alias => $term_id ) {
@@ -367,7 +399,6 @@ final class PH_Smart_Location {
 	private function forget_terms() {
 		$this->terms      = null;
 		$this->term_index = null;
-		$this->depths     = null;
 	}
 
 	private function term_ancestors( $term_id ) {
@@ -391,75 +422,38 @@ final class PH_Smart_Location {
 		return implode( ' › ', $names );
 	}
 
-	private function depth( $term_id ) {
-		$this->load_terms();
-		return $this->depths[ (int) $term_id ] ?? 0;
-	}
-
-	/** @return int[] term ids at a level, e.g. all suburbs. */
-	public function terms_at_depth( $depth ) {
-		$this->load_terms();
-		return array_keys( array_filter( $this->depths, function ( $d ) use ( $depth ) {
-			return $d === $depth;
-		} ) );
-	}
-
-	/** Regions (level 2) under a city, or every region if no city: term id => label. */
-	private function regions_for( $city_id ) {
-		$this->load_terms();
-		$out = array();
-		foreach ( $this->terms_at_depth( self::DEPTH_REGION ) as $id ) {
-			if ( ! $city_id || (int) $this->terms[ $id ]->parent === (int) $city_id ) {
-				$out[ $id ] = $city_id ? $this->terms[ $id ]->name : $this->term_path( $id );
-			}
-		}
-		asort( $out );
-		return $out;
-	}
-
 	/**
-	 * Find a Location by name at a given level. Where several match (e.g. "Newtown" in two
-	 * cities), prefer the one under $within.
+	 * Find an existing Location by name, anywhere in the hierarchy. Where several share a name
+	 * (e.g. "Newtown" in two towns), prefer the one whose parent appears in the OSM address.
 	 */
-	private function find_at_depth( $name, $depth, $within = 0 ) {
+	private function find_term( $name, $address = array() ) {
 		$this->load_terms();
 		$key = self::normalise( $name );
 		if ( '' === $key || empty( $this->term_index[ $key ] ) ) {
 			return 0;
 		}
-		$ids = array_values( array_filter( array_unique( $this->term_index[ $key ] ), function ( $id ) use ( $depth ) {
-			return ( $this->depths[ $id ] ?? 0 ) === $depth;
-		} ) );
-		if ( ! $ids ) {
-			return 0;
-		}
-		if ( $within ) {
+		$ids = array_values( array_unique( $this->term_index[ $key ] ) );
+		if ( count( $ids ) > 1 ) {
+			$context = array();
+			foreach ( self::$osm_context_fields as $f ) {
+				if ( ! empty( $address[ $f ] ) && is_string( $address[ $f ] ) ) {
+					$context[] = self::normalise( $address[ $f ] );
+				}
+			}
 			foreach ( $ids as $id ) {
-				if ( in_array( (int) $within, $this->term_ancestors( $id ), true ) ) {
-					return $id;
+				foreach ( $this->term_ancestors( $id ) as $a ) {
+					if ( isset( $this->terms[ $a ] ) && in_array( self::normalise( $this->terms[ $a ]->name ), $context, true ) ) {
+						return $id;
+					}
 				}
 			}
 		}
 		return $ids[0];
 	}
 
-	/** The city (level-1 Location) for an OSM address: matched by name, else the default city, else the only city. */
-	private function city_for( $address ) {
-		foreach ( self::$city_fields as $f ) {
-			if ( ! empty( $address[ $f ] ) && is_string( $address[ $f ] ) && ( $id = $this->find_at_depth( $address[ $f ], self::DEPTH_CITY ) ) ) {
-				return $id;
-			}
-		}
-		$default = (int) self::settings()['default_city'];
-		if ( $default && self::DEPTH_CITY === $this->depth( $default ) ) {
-			return $default;
-		}
-		$cities = $this->terms_at_depth( self::DEPTH_CITY );
-		return 1 === count( $cities ) ? $cities[0] : 0;
-	}
-
-	private function create_term( $name, $parent ) {
-		$r = wp_insert_term( $name, self::TAXONOMY, array( 'parent' => (int) $parent ) );
+	/** Create a new suburb Location at the top level; the site arranges its hierarchy. */
+	private function create_term( $name ) {
+		$r = wp_insert_term( $name, self::TAXONOMY, array( 'parent' => 0 ) );
 		if ( is_wp_error( $r ) ) {
 			if ( 'term_exists' === $r->get_error_code() && $r->get_error_data() ) {
 				return (int) $r->get_error_data();
@@ -477,10 +471,10 @@ final class PH_Smart_Location {
 		return is_wp_error( $ids ) ? array() : array_map( 'intval', $ids );
 	}
 
-	/** Location mode: the property has no level-3 (suburb) Location. */
+	/** Location mode: the property has none of the Locations known to be suburbs. */
 	private function suburb_is_empty( $property_id ) {
 		if ( self::uses_taxonomy() ) {
-			return ! array_intersect( $this->assigned_term_ids( $property_id ), $this->terms_at_depth( self::DEPTH_SUBURB ) );
+			return ! array_intersect( $this->assigned_term_ids( $property_id ), self::suburb_term_ids() );
 		}
 		return ! self::meta_values( $property_id, self::settings()['suburb_key'] );
 	}
@@ -568,7 +562,7 @@ final class PH_Smart_Location {
 	private function suburb_empty_sql() {
 		global $wpdb;
 		if ( self::uses_taxonomy() ) {
-			$ids = $this->terms_at_depth( self::DEPTH_SUBURB );
+			$ids = self::suburb_term_ids();
 			if ( ! $ids ) {
 				return '1=1';
 			}
@@ -723,9 +717,8 @@ final class PH_Smart_Location {
 	 * Work out (and, in assign mode, save) the suburb – and any enabled neighbourhood / quarter
 	 * custom fields – for one property.
 	 *
-	 * Location mode: the suburb is a level-3 Location (City › Region › Suburb). An existing suburb
-	 * is reused wherever it is; a new one is created under a region of the property's city:
-	 * the only region, else the one Claude picks, else the fallback region, else held for review.
+	 * Location mode: an existing Location with the suburb's name is reused wherever it sits in the
+	 * hierarchy; otherwise a new top-level Location is created for the site to arrange.
 	 *
 	 * @param bool $dry_run Save and record nothing (test tool).
 	 * @return array Result (verbose; only ever logged, never stored on the property).
@@ -740,8 +733,6 @@ final class PH_Smart_Location {
 			'suburb'      => '',
 			'src'         => '',
 			'term_id'     => 0,
-			'city'        => 0,
-			'region'      => 0,
 			'extras'      => array(), // OSM field => value for neighbourhood / quarter custom fields
 			'l'           => array_map( 'intval', (array) ( $prev['l'] ?? array() ) ),
 			'o'           => null,
@@ -798,25 +789,13 @@ final class PH_Smart_Location {
 				$r['o'] = '' !== $r['suburb'] ? 1 : 0;
 			}
 
-			$regions = array();
-			if ( self::uses_taxonomy() ) {
-				$r['city'] = $this->city_for( $address );
-				$regions   = $this->regions_for( $r['city'] );
-				if ( '' !== $r['suburb'] ) {
-					$r['term_id'] = $this->find_at_depth( $r['suburb'], self::DEPTH_SUBURB, $r['city'] );
-				}
-			}
-
-			/* 2. Claude: for the suburb when OSM has none, and/or the region for a new suburb */
-			$ask_suburb = '' === $r['suburb'];
-			$ask_region = self::uses_taxonomy() && $s['create_terms'] && count( $regions ) > 1 && ! $r['term_id'];
-			$c          = null;
-			if ( ( $ask_suburb || $ask_region ) && $s['use_claude'] ) {
+			/* 2. Claude, when OpenStreetMap has no suburb */
+			if ( '' === $r['suburb'] && $s['use_claude'] ) {
 				if ( ! self::claude_enabled() ) {
 					$r['a']       = 'nokey';
 					$r['notes'][] = 'Claude skipped: no API key';
 				} else {
-					$c = $this->claude_lookup( $pid, $postcode, $osm, $ask_suburb ? '' : $r['suburb'], $ask_region ? $regions : array(), $r['city'] );
+					$c = $this->claude_lookup( $pid, $postcode, $osm );
 					if ( is_wp_error( $c ) ) {
 						$r['a']       = 'error';
 						$r['notes'][] = 'Claude: ' . $c->get_error_message();
@@ -825,19 +804,15 @@ final class PH_Smart_Location {
 							$r['halt']   = true;
 							return $this->finish( $r, $dry_run );
 						}
-						$c = null;
 					} else {
 						$r['context']['claude'] = $c;
-						$ranks           = array( 'low' => 1, 'medium' => 2, 'high' => 3 );
-						$c['confident']  = ( $ranks[ $c['confidence'] ] ?? 0 ) >= $ranks[ $s['claude_min_confidence'] ];
-						$r['a']          = $c['confident'] ? 'used' : 'unsure';
-						if ( $ask_suburb && '' !== $c['suburb'] ) {
-							if ( $c['confident'] ) {
+						$ranks     = array( 'low' => 1, 'medium' => 2, 'high' => 3 );
+						$confident = ( $ranks[ $c['confidence'] ] ?? 0 ) >= $ranks[ $s['claude_min_confidence'] ];
+						$r['a']    = $confident ? 'used' : 'unsure';
+						if ( '' !== $c['suburb'] ) {
+							if ( $confident ) {
 								$r['suburb'] = $c['suburb'];
 								$r['src']    = 'claude';
-								if ( self::uses_taxonomy() ) {
-									$r['term_id'] = $this->find_at_depth( $r['suburb'], self::DEPTH_SUBURB, $r['city'] );
-								}
 							} else {
 								$r['notes'][] = sprintf( 'Claude suggested "%s" with low confidence (not used)', $c['suburb'] );
 							}
@@ -846,17 +821,21 @@ final class PH_Smart_Location {
 				}
 			}
 
-			/* 3. Existing suburb, or where a new one would go */
+			/* 3. Existing Location / existing spelling */
 			if ( '' !== $r['suburb'] ) {
 				if ( self::uses_taxonomy() ) {
+					$r['term_id'] = $this->find_term( $r['suburb'], $address );
 					if ( $r['term_id'] ) {
 						$r['suburb'] = $this->terms[ $r['term_id'] ]->name;
+						if ( ! $dry_run ) {
+							$this->add_suburb_terms( array( $r['term_id'] ) ); // it's a suburb, whatever happens next
+						}
 					} elseif ( ! $s['create_terms'] ) {
 						$r['notes'][] = sprintf( 'suburb "%s" is not a Location and creating Locations is switched off', $r['suburb'] );
 						$r['suburb']  = '';
 						$r['src']     = '';
 					} else {
-						$r['region'] = $this->choose_region( $regions, $c, $r['notes'] );
+						$r['notes'][] = 'new top-level Location';
 					}
 				} else {
 					$vocab = $this->meta_vocab();
@@ -876,12 +855,7 @@ final class PH_Smart_Location {
 			return $this->finish( $r, $dry_run );
 		}
 
-		$new_suburb = self::uses_taxonomy() && '' !== $r['suburb'] && ! $r['term_id'];
-		if ( $new_suburb && ! $r['region'] ) {
-			$r['status'] = 'review';
-		} else {
-			$r['status'] = 'assign' === $s['mode'] ? 'assigned' : 'suggested';
-		}
+		$r['status'] = 'assign' === $s['mode'] ? 'assigned' : 'suggested';
 		if ( ! $dry_run && 'assigned' === $r['status'] ) {
 			$saved = $this->save_values( $pid, $r );
 			if ( is_wp_error( $saved ) ) {
@@ -893,34 +867,8 @@ final class PH_Smart_Location {
 	}
 
 	/**
-	 * Region (level 2) for a new suburb: the city's only region, else Claude's confident choice,
-	 * else the fallback region setting. 0 = hold for review.
-	 */
-	private function choose_region( $regions, $c, &$notes ) {
-		if ( 1 === count( $regions ) ) {
-			return (int) key( $regions );
-		}
-		if ( $c && ! empty( $c['region'] ) ) {
-			$id = array_search( $c['region'], $regions, true );
-			if ( false !== $id ) {
-				if ( $c['confident'] ) {
-					return (int) $id;
-				}
-				$notes[] = sprintf( 'Claude suggested region "%s" with low confidence (not used)', $c['region'] );
-			}
-		}
-		$fallback = (int) self::settings()['fallback_region'];
-		if ( $fallback && self::DEPTH_REGION === $this->depth( $fallback ) ) {
-			$notes[] = 'region from the fallback setting';
-			return $fallback;
-		}
-		$notes[] = $regions ? 'region could not be worked out – held for review' : 'no regions found for the city – held for review';
-		return 0;
-	}
-
-	/**
 	 * Save values. The suburb Location is added alongside any already on the property (never
-	 * removed), creating it under its region if new. Custom fields are only written when empty.
+	 * removed), creating it at the top level if new. Custom fields are only written when empty.
 	 *
 	 * @return true|WP_Error
 	 */
@@ -930,19 +878,16 @@ final class PH_Smart_Location {
 			if ( self::uses_taxonomy() ) {
 				$tid = (int) $r['term_id'];
 				if ( ! $tid ) {
-					// May have been created since the suggestion was made.
-					$tid = $this->find_at_depth( $r['suburb'], self::DEPTH_SUBURB, (int) $r['city'] );
+					$tid = $this->find_term( $r['suburb'] ); // may have been created since the suggestion was made
 				}
 				if ( ! $tid ) {
-					if ( self::DEPTH_REGION !== $this->depth( $r['region'] ) ) {
-						return new WP_Error( 'region', 'A region (level-2 Location) is needed to create suburb "' . $r['suburb'] . '"' );
-					}
-					$tid = $this->create_term( $r['suburb'], $r['region'] );
+					$tid = $this->create_term( $r['suburb'] );
 					if ( is_wp_error( $tid ) ) {
 						return new WP_Error( 'term', 'Could not create Location "' . $r['suburb'] . '": ' . $tid->get_error_message() );
 					}
-					$this->log( 'info', sprintf( 'Created suburb Location "%s"', $this->term_path( $tid ) ), $pid );
+					$this->log( 'info', sprintf( 'Created top-level Location "%s"', $r['suburb'] ), $pid );
 				}
+				$this->add_suburb_terms( array( $tid ) );
 				$set = wp_set_object_terms( $pid, array( $tid ), self::TAXONOMY, true );
 				if ( is_wp_error( $set ) ) {
 					return $set;
@@ -976,19 +921,13 @@ final class PH_Smart_Location {
 
 		$parts = array();
 		if ( '' !== $r['suburb'] ) {
-			if ( $r['term_id'] ) {
-				$label = $this->term_path( $r['term_id'] );
-			} elseif ( $r['region'] ) {
-				$label = $this->term_path( $r['region'] ) . ' › ' . $r['suburb'] . ' (new)';
-			} else {
-				$label = $r['suburb'] . ( self::uses_taxonomy() ? ' (new, region needed)' : '' );
-			}
+			$label = $r['term_id'] ? $this->term_path( $r['term_id'] ) : $r['suburb'] . ( self::uses_taxonomy() ? ' (new)' : '' );
 			$parts[] = sprintf( 'suburb "%s" from %s', $label, 'claude' === $r['src'] ? 'Claude' : 'OSM' );
 		}
 		foreach ( $r['extras'] as $f => $v ) {
 			$parts[] = sprintf( '%s "%s"', $f, $v );
 		}
-		$labels       = array( 'review' => 'Needs region', 'not_found' => 'Nothing found' );
+		$labels       = array( 'not_found' => 'Nothing found' );
 		$r['message'] = ( $labels[ $r['status'] ] ?? ucfirst( $r['status'] ) ) . ( $parts ? ': ' . implode( '; ', $parts ) : '' ) . ( $r['notes'] ? ' – ' . implode( '; ', $r['notes'] ) : '' );
 		if ( 'retry' === $r['status'] && empty( $r['halt'] ) ) {
 			$r['message'] .= sprintf( ' (will retry, attempt %d of 3)', $r['n'] );
@@ -1011,13 +950,11 @@ final class PH_Smart_Location {
 			'n'   => 'retry' === $r['status'] ? $r['n'] : null,
 			'l'   => $r['l'] ? $r['l'] : null,
 		);
-		if ( in_array( $r['status'], array( 'suggested', 'review' ), true ) ) {
+		if ( 'suggested' === $r['status'] ) {
 			$state['v'] = array_filter(
 				array(
 					'n'  => $r['suburb'],
 					't'  => $r['term_id'],
-					'p'  => $r['term_id'] ? 0 : $r['region'],
-					'c'  => $r['city'],
 					'nb' => $r['extras']['neighbourhood'] ?? '',
 					'q'  => $r['extras']['quarter'] ?? '',
 				)
@@ -1025,7 +962,7 @@ final class PH_Smart_Location {
 		}
 		$this->set_state( $pid, $r['status'], $state );
 
-		$level = array( 'error' => 'error', 'retry' => 'warning', 'not_found' => 'warning', 'review' => 'warning' )[ $r['status'] ] ?? 'info';
+		$level = array( 'error' => 'error', 'retry' => 'warning', 'not_found' => 'warning' )[ $r['status'] ] ?? 'info';
 		$this->log( $level, $r['message'], $pid, $r['context'] );
 		return $r;
 	}
@@ -1131,15 +1068,12 @@ final class PH_Smart_Location {
 	 * =================================================================== */
 
 	/**
-	 * Ask Claude for the suburb (when $known_suburb is empty) and/or which of $regions a new
-	 * suburb belongs to (when $regions is given).
+	 * Ask Claude for the suburb.
 	 *
-	 * @param array $regions term id => label.
-	 * @return array|WP_Error array( suburb, region (label), confidence, reason, model, input_tokens, output_tokens )
+	 * @return array|WP_Error array( suburb, confidence, reason, model, input_tokens, output_tokens )
 	 */
-	private function claude_lookup( $pid, $postcode, $osm, $known_suburb, $regions, $city_id ) {
+	private function claude_lookup( $pid, $postcode, $osm ) {
 		$s = self::settings();
-		$this->load_terms();
 
 		$lines = array( 'Address: ' . $this->address_query( $pid ) );
 		if ( $postcode ) {
@@ -1161,36 +1095,14 @@ final class PH_Smart_Location {
 			}
 		}
 		$lines[] = 'OpenStreetMap areas at this location: ' . ( $areas ? implode( ', ', $areas ) : 'none' );
-		if ( '' !== $known_suburb ) {
-			$lines[] = 'Suburb: ' . $known_suburb;
-		}
-
-		$tasks = array();
-		if ( '' === $known_suburb ) {
-			$tasks[] = 'Identify the suburb: the locally recognised district or area name an estate agent would use for this address (for example "Edgbaston" or "Kings Norton"). Do not give the city, county, a building, a road or a housing development name. OpenStreetMap data may be missing or wrong; use your own knowledge of the area. If you are not reasonably sure, return an empty suburb.';
-		}
+		$tasks   = array();
+		$tasks[] = 'Identify the suburb: the locally recognised district or area name an estate agent would use for this address (for example "Edgbaston" or "Kings Norton"). Do not give the city, county, a building, a road or a housing development name. OpenStreetMap data may be missing or wrong; use your own knowledge of the area. If you are not reasonably sure, return an empty suburb.';
 		$properties = array(
 			'suburb'     => array( 'type' => 'string' ),
-			'region'     => array( 'type' => 'string' ),
 			'confidence' => array( 'type' => 'string', 'enum' => array( 'high', 'medium', 'low' ) ),
 			'reason'     => array( 'type' => 'string' ),
 		);
-		if ( $regions ) {
-			$list = array();
-			foreach ( $regions as $id => $label ) {
-				$children = array();
-				foreach ( $this->terms as $t ) {
-					if ( (int) $t->parent === (int) $id ) {
-						$children[] = $t->name;
-					}
-				}
-				$list[] = '- ' . $label . ( $children ? ' (already includes: ' . implode( ', ', array_slice( $children, 0, 40 ) ) . ')' : '' );
-			}
-			$city    = $city_id && isset( $this->terms[ $city_id ] ) ? ' of ' . $this->terms[ $city_id ]->name : '';
-			$tasks[] = 'The agency divides the area' . $city . " into these regions:\n" . implode( "\n", $list ) . "\nChoose the region this property's suburb belongs to, based on where it is. Use the region name exactly as written. Return an empty region if you are not reasonably sure.";
-			$properties['region']['enum'] = array_merge( array_values( $regions ), array( '' ) );
-		}
-		$tasks[] = 'Give your confidence and a one-sentence reason. Return an empty string for anything you were not asked for.';
+		$tasks[] = 'Give your confidence and a one-sentence reason.';
 
 		$body = array(
 			'model'         => $s['claude_model'],
@@ -1202,7 +1114,7 @@ final class PH_Smart_Location {
 					'schema' => array(
 						'type'                 => 'object',
 						'properties'           => $properties,
-						'required'             => array( 'suburb', 'region', 'confidence', 'reason' ),
+						'required'             => array( 'suburb', 'confidence', 'reason' ),
 						'additionalProperties' => false,
 					),
 				),
@@ -1237,10 +1149,8 @@ final class PH_Smart_Location {
 		if ( ! is_array( $data ) ) {
 			return new WP_Error( 'claude_bad_output', 'unexpected answer (stop reason: ' . ( $response['stop_reason'] ?? '?' ) . ')' );
 		}
-		$region = trim( (string) ( $data['region'] ?? '' ) );
 		return array(
-			'suburb'        => '' === $known_suburb ? trim( (string) ( $data['suburb'] ?? '' ) ) : '',
-			'region'        => in_array( $region, $regions, true ) ? $region : '',
+			'suburb'        => trim( (string) ( $data['suburb'] ?? '' ) ),
 			'confidence'    => in_array( $data['confidence'] ?? '', array( 'high', 'medium', 'low' ), true ) ? $data['confidence'] : 'low',
 			'reason'        => trim( (string) ( $data['reason'] ?? '' ) ),
 			'model'         => $response['model'] ?? $s['claude_model'],
@@ -1339,7 +1249,7 @@ final class PH_Smart_Location {
 			array(
 				'property'       => get_the_title( $pid ),
 				'current_suburb' => $this->current_suburb_label( $pid ),
-				'note'           => 'Test only: nothing was saved, created or recorded. A property that already has a suburb (level-3 Location) and filled custom fields is skipped.',
+				'note'           => 'Test only: nothing was saved, created or recorded. A property that already has a known suburb Location and filled custom fields is skipped.',
 				'result'         => $r,
 				'osm_request'    => $this->last_osm,
 			)
@@ -1350,14 +1260,9 @@ final class PH_Smart_Location {
 	 * admin-post actions
 	 * =================================================================== */
 
-	/**
-	 * Save a suggestion, or a property held for review once a region is chosen.
-	 *
-	 * @param int $region_id Region (level-2 Location) for a new suburb; overrides the suggested one.
-	 */
-	private function apply_one( $pid, $region_id = 0 ) {
-		$status = get_post_meta( $pid, self::META_STATUS, true );
-		if ( ! in_array( $status, array( 'suggested', 'review' ), true ) ) {
+	/** Save a suggestion. */
+	private function apply_one( $pid ) {
+		if ( 'suggested' !== get_post_meta( $pid, self::META_STATUS, true ) ) {
 			return false;
 		}
 		$state = self::get_state( $pid );
@@ -1365,8 +1270,6 @@ final class PH_Smart_Location {
 		$r     = array(
 			'suburb'  => (string) ( $v['n'] ?? '' ),
 			'term_id' => (int) ( $v['t'] ?? 0 ),
-			'region'  => $region_id ? (int) $region_id : (int) ( $v['p'] ?? 0 ),
-			'city'    => (int) ( $v['c'] ?? 0 ),
 			'extras'  => array_filter( array( 'neighbourhood' => $v['nb'] ?? '', 'quarter' => $v['q'] ?? '' ) ),
 			'src'     => (string) ( $state['src'] ?? '' ),
 			'l'       => (array) ( $state['l'] ?? array() ),
@@ -1385,7 +1288,7 @@ final class PH_Smart_Location {
 
 	public function handle_apply() {
 		$this->check_admin_request( 'phsl_apply' );
-		$ok = $this->apply_one( absint( $_POST['property_id'] ?? 0 ), absint( $_POST['region_id'] ?? 0 ) );
+		$ok = $this->apply_one( absint( $_POST['property_id'] ?? 0 ) );
 		$this->redirect( 'results', $ok ? 'applied' : 'apply_failed' );
 	}
 
@@ -1541,13 +1444,13 @@ final class PH_Smart_Location {
 			<h2>Status</h2>
 			<p><strong>Mode:</strong>
 				<?php if ( 'assign' === $s['mode'] ) : ?>
-					<span class="phsl-badge phsl-assigned">Assign automatically</span>: values are saved<?php echo $tax && $s['create_terms'] ? ' and new suburbs are created under their region' : ''; ?>.
+					<span class="phsl-badge phsl-assigned">Assign automatically</span>: values are saved<?php echo $tax && $s['create_terms'] ? ' and new suburbs are created as top-level Locations' : ''; ?>.
 				<?php else : ?>
 					<span class="phsl-badge phsl-suggested">Suggest only</span>: nothing is saved or created; review suggestions on the Results tab.
 				<?php endif; ?>
 			</p>
-			<p><strong>Suburb → <?php echo esc_html( $tax ? 'Location (City › Region › Suburb)' : 'custom field ' . $s['suburb_key'] ); ?>:</strong> OpenStreetMap suburb
-				<?php if ( self::claude_enabled() ) : ?>, then <strong><?php echo esc_html( self::$models[ $s['claude_model'] ] ); ?></strong><?php echo $tax ? ' (also chooses the region for a new suburb)' : ''; ?>.
+			<p><strong>Suburb → <?php echo esc_html( $tax ? 'Location' : 'custom field ' . $s['suburb_key'] ); ?>:</strong> OpenStreetMap suburb
+				<?php if ( self::claude_enabled() ) : ?>, then <strong><?php echo esc_html( self::$models[ $s['claude_model'] ] ); ?></strong>.
 				<?php elseif ( $s['use_claude'] ) : ?>. <span class="phsl-warn">Claude is enabled but there is no API key.</span>
 				<?php else : ?>. Claude is off.<?php endif; ?>
 			</p>
@@ -1555,9 +1458,9 @@ final class PH_Smart_Location {
 			<p><strong>New properties:</strong> <?php echo esc_html( $when ? 'processed ' . implode( ' and ', $when ) : 'not processed automatically' ); ?>.</p>
 			<table class="widefat phsl-counts"><tbody>
 				<tr><td>Properties in scope</td><td class="num"><?php echo esc_html( number_format_i18n( $c['total'] ) ); ?></td></tr>
-				<tr><td>Without a suburb<?php echo $tax ? ' (level-3 Location)' : ''; ?></td><td class="num"><?php echo esc_html( number_format_i18n( $c['missing_suburb'] ) ); ?></td></tr>
+				<tr><td>Without a <?php echo $tax ? 'known suburb Location' : 'suburb'; ?></td><td class="num"><?php echo esc_html( number_format_i18n( $c['missing_suburb'] ) ); ?></td></tr>
 				<tr><td>Waiting to be processed</td><td class="num" id="phsl-to-process"><?php echo esc_html( number_format_i18n( $c['to_process'] ) ); ?></td></tr>
-				<?php foreach ( array( 'review' => 'Needs a region (new suburb)', 'suggested' => 'Suggestions awaiting review', 'assigned' => 'Assigned', 'not_found' => 'Nothing found', 'retry' => 'Waiting to retry', 'error' => 'Errors' ) as $k => $label ) : ?>
+				<?php foreach ( array( 'suggested' => 'Suggestions awaiting review', 'assigned' => 'Assigned', 'not_found' => 'Nothing found', 'retry' => 'Waiting to retry', 'error' => 'Errors' ) as $k => $label ) : ?>
 					<tr><td><a href="<?php echo esc_url( self::page_url( 'results', array( 'status' => $k ) ) ); ?>"><?php echo esc_html( $label ); ?></a></td><td class="num"><?php echo esc_html( number_format_i18n( $c[ 'status_' . $k ] ?? 0 ) ); ?></td></tr>
 				<?php endforeach; ?>
 			</tbody></table>
@@ -1566,21 +1469,18 @@ final class PH_Smart_Location {
 		<?php
 		if ( $tax ) :
 			$this->load_terms();
-			$deeper = count( array_filter( $this->depths, function ( $d ) {
-				return $d > self::DEPTH_SUBURB;
-			} ) );
+			$names = array();
+			foreach ( self::suburb_term_ids() as $id ) {
+				if ( isset( $this->terms[ $id ] ) ) {
+					$names[] = $this->terms[ $id ]->name;
+				}
+			}
+			natcasesort( $names );
 			?>
 			<div class="phsl-card">
-				<h2>Location structure</h2>
-				<table class="widefat phsl-counts"><tbody>
-					<tr><td>Cities (level 1)</td><td class="num"><?php echo count( $this->terms_at_depth( self::DEPTH_CITY ) ); ?></td></tr>
-					<tr><td>Regions (level 2)</td><td class="num"><?php echo count( $this->terms_at_depth( self::DEPTH_REGION ) ); ?></td></tr>
-					<tr><td>Suburbs (level 3)</td><td class="num"><?php echo count( $this->terms_at_depth( self::DEPTH_SUBURB ) ); ?></td></tr>
-				</tbody></table>
-				<p class="description">A property with any level-3 Location already has its suburb (for example matched from its address during import) and needs no lookup. New suburbs are created under a region of the property’s city: the city’s only region, otherwise the one Claude chooses, otherwise the fallback region in Settings, otherwise the property is held for you to pick one on the Results tab.</p>
-				<?php if ( $deeper ) : ?>
-					<p class="phsl-warn"><?php echo esc_html( sprintf( '%d Locations are deeper than level 3. Property Hive only fully supports 3 levels, so these may not show in its screens.', $deeper ) ); ?></p>
-				<?php endif; ?>
+				<h2>Known suburbs (<?php echo count( $names ); ?>)</h2>
+				<p class="description">Locations Smart Location has identified as suburbs (matched or created), stored in the <code><?php echo esc_html( self::SUBURBS_OPTION ); ?></code> option. A property that already has one of these, for example matched from its address during import, needs no lookup. New suburbs are created as top-level Locations; arrange them in your Location hierarchy however you like – they are still recognised wherever they sit. The list grows as properties are looked up.</p>
+				<p><?php echo $names ? esc_html( implode( ', ', $names ) ) : '–'; ?></p>
 			</div>
 		<?php endif; ?>
 
@@ -1622,7 +1522,7 @@ final class PH_Smart_Location {
 
 	private function render_results() {
 		global $wpdb;
-		$labels   = array( 'review' => 'Needs region', 'suggested' => 'Suggested', 'assigned' => 'Assigned', 'not_found' => 'Nothing found', 'retry' => 'Waiting to retry', 'error' => 'Error', 'skipped' => 'Skipped' );
+		$labels   = array( 'suggested' => 'Suggested', 'assigned' => 'Assigned', 'not_found' => 'Nothing found', 'retry' => 'Waiting to retry', 'error' => 'Error', 'skipped' => 'Skipped' );
 		$status   = sanitize_key( $_GET['status'] ?? '' );
 		$paged    = max( 1, absint( $_GET['paged'] ?? 1 ) );
 		$per_page = 50;
@@ -1650,7 +1550,7 @@ final class PH_Smart_Location {
 					<?php endforeach; ?>
 				</select>
 			</form>
-			<?php $this->post_button( 'phsl_apply_all', 'Apply all suggestions', array(), 'button button-primary', 'Save all suggestions to their properties? New suburbs are created under their region. Properties needing a region are not included.' ); ?>
+			<?php $this->post_button( 'phsl_apply_all', 'Apply all suggestions', array(), 'button button-primary', 'Save all suggestions to their properties? New suburbs are created as top-level Locations.' ); ?>
 			<span class="description"><?php echo esc_html( number_format_i18n( $total ) ); ?> properties. Full details of each decision are in the Log.</span>
 		</div>
 		<table class="widefat striped">
@@ -1669,15 +1569,9 @@ final class PH_Smart_Location {
 				$pid     = (int) $row->ID;
 				$st      = self::get_state( $pid );
 				$v       = (array) ( $st['v'] ?? array() );
-				$pending = in_array( $row->status, array( 'suggested', 'review' ), true );
+				$pending = 'suggested' === $row->status;
 				if ( $pending ) {
-					if ( ! empty( $v['t'] ) ) {
-						$sub = $this->term_path( $v['t'] );
-					} elseif ( ! empty( $v['p'] ) ) {
-						$sub = $this->term_path( $v['p'] ) . ' › ' . ( $v['n'] ?? '' );
-					} else {
-						$sub = (string) ( $v['n'] ?? '' );
-					}
+					$sub    = ! empty( $v['t'] ) ? $this->term_path( $v['t'] ) : (string) ( $v['n'] ?? '' );
 					$is_new = self::uses_taxonomy() && ! empty( $v['n'] ) && empty( $v['t'] );
 				} else {
 					$sub    = $this->current_suburb_label( $pid );
@@ -1696,20 +1590,7 @@ final class PH_Smart_Location {
 					<td><?php echo esc_html( isset( $st['a'] ) ? ( $claude_label[ $st['a'] ] ?? $st['a'] ) : '–' ); ?></td>
 					<td><span class="phsl-badge phsl-<?php echo esc_attr( $row->status ); ?>"><?php echo esc_html( $labels[ $row->status ] ?? $row->status ); ?></span></td>
 					<td class="phsl-actions">
-						<?php if ( 'review' === $row->status ) : ?>
-							<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="phsl-inline">
-								<input type="hidden" name="action" value="phsl_apply">
-								<input type="hidden" name="property_id" value="<?php echo esc_attr( $pid ); ?>">
-								<?php wp_nonce_field( 'phsl_apply' ); ?>
-								<select name="region_id" required>
-									<option value="">Region…</option>
-									<?php foreach ( $this->regions_for( (int) ( $v['c'] ?? 0 ) ) ?: $this->regions_for( 0 ) as $rid => $rlabel ) : ?>
-										<option value="<?php echo esc_attr( $rid ); ?>"><?php echo esc_html( $rlabel ); ?></option>
-									<?php endforeach; ?>
-								</select>
-								<button type="submit" class="button button-small button-primary">Create &amp; assign</button>
-							</form>
-						<?php elseif ( 'suggested' === $row->status ) : ?>
+						<?php if ( 'suggested' === $row->status ) : ?>
 							<?php $this->post_button( 'phsl_apply', 'Apply', array( 'property_id' => $pid ), 'button button-small button-primary' ); ?>
 						<?php endif; ?>
 						<?php $this->post_button( 'phsl_retry', 'Retry', array( 'property_id' => $pid ), 'button button-small' ); ?>
@@ -1793,13 +1674,6 @@ final class PH_Smart_Location {
 	private function render_settings() {
 		$s         = self::settings();
 		$const_key = defined( 'PHSL_ANTHROPIC_API_KEY' ) && PHSL_ANTHROPIC_API_KEY;
-		$this->load_terms();
-		$cities = array();
-		foreach ( $this->terms_at_depth( self::DEPTH_CITY ) as $id ) {
-			$cities[ $id ] = $this->terms[ $id ]->name;
-		}
-		asort( $cities );
-		$regions = $this->regions_for( 0 );
 		?>
 		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
 			<input type="hidden" name="action" value="phsl_save_settings">
@@ -1811,8 +1685,8 @@ final class PH_Smart_Location {
 					<th scope="row">Mode</th>
 					<td>
 						<label class="phsl-block"><input type="radio" name="mode" value="suggest" <?php checked( $s['mode'], 'suggest' ); ?>> <strong>Suggest only</strong>: list values on the Results tab for review; nothing is saved or created.</label>
-						<label class="phsl-block"><input type="radio" name="mode" value="assign" <?php checked( $s['mode'], 'assign' ); ?>> <strong>Assign automatically</strong>: save values to the property (creating new suburbs if needed).</label>
-						<p class="description">The suburb Location is only ever <strong>added</strong>; existing Locations are never removed. A property that already has a suburb (any level-3 Location, e.g. matched from its address during import) is left alone. Custom fields are only filled when empty.</p>
+						<label class="phsl-block"><input type="radio" name="mode" value="assign" <?php checked( $s['mode'], 'assign' ); ?>> <strong>Assign automatically</strong>: save values to the property (creating new suburb Locations if needed).</label>
+						<p class="description">The suburb Location is only ever <strong>added</strong>; existing Locations are never removed. A property that already has a known suburb Location (e.g. matched from its address during import) is left alone. Custom fields are only filled when empty.</p>
 					</td>
 				</tr>
 				<tr>
@@ -1838,37 +1712,17 @@ final class PH_Smart_Location {
 				<tr>
 					<th scope="row">Assign the suburb to</th>
 					<td>
-						<label class="phsl-block"><input type="radio" name="suburb_target" value="taxonomy" <?php checked( $s['suburb_target'], 'taxonomy' ); ?>> <strong>Location</strong>, structured <strong>City › Region › Suburb</strong> (the suburb is a level-3 Location)</label>
+						<label class="phsl-block"><input type="radio" name="suburb_target" value="taxonomy" <?php checked( $s['suburb_target'], 'taxonomy' ); ?>> <strong>Location</strong> (Property Hive’s Location taxonomy)</label>
 						<label class="phsl-block"><input type="radio" name="suburb_target" value="meta" <?php checked( $s['suburb_target'], 'meta' ); ?>> Custom field <input type="text" name="suburb_key" class="regular-text code phsl-short" value="<?php echo esc_attr( $s['suburb_key'] ); ?>"></label>
-						<p class="description">The suburb comes from OpenStreetMap’s suburb, or from Claude when OpenStreetMap has none. Existing suburbs are matched by name, ignoring case and punctuation (“King’s Norton” = “Kings Norton”).</p>
+						<p class="description">The suburb comes from OpenStreetMap’s suburb, or from Claude when OpenStreetMap has none. Existing Locations are matched by name wherever they sit in the hierarchy, ignoring case and punctuation (“King’s Norton” = “Kings Norton”).</p>
 					</td>
 				</tr>
 				<tr>
 					<th scope="row">New suburbs</th>
 					<td>
 						<label class="phsl-block"><input type="checkbox" name="create_terms" value="1" <?php checked( $s['create_terms'] ); ?>> Create the suburb Location if it doesn’t exist yet</label>
-						<p class="description">A new suburb is created under a region of the property’s city: the city’s only region, otherwise the region Claude chooses, otherwise the fallback below, otherwise it waits on the Results tab for you to pick the region.</p>
+						<p class="description">New suburbs are created as <strong>top-level</strong> Locations. Arrange them in your Location hierarchy however suits you (Settings → Custom Fields → Locations); Smart Location still recognises them wherever they are moved to.</p>
 					</td>
-				</tr>
-				<tr>
-					<th scope="row"><label for="phsl-city">Default city</label></th>
-					<td><select id="phsl-city" name="default_city">
-						<option value="">— none —</option>
-						<?php foreach ( $cities as $id => $name ) : ?>
-							<option value="<?php echo esc_attr( $id ); ?>" <?php selected( (string) $s['default_city'], (string) $id ); ?>><?php echo esc_html( $name ); ?></option>
-						<?php endforeach; ?>
-					</select>
-					<p class="description">The city is matched from OpenStreetMap’s city/town. This is used when that doesn’t match a level-1 Location (for example surrounding towns). With only one city it is used automatically.</p></td>
-				</tr>
-				<tr>
-					<th scope="row"><label for="phsl-fallback-region">Fallback region</label></th>
-					<td><select id="phsl-fallback-region" name="fallback_region">
-						<option value="">Hold for review (pick the region on the Results tab)</option>
-						<?php foreach ( $regions as $id => $label ) : ?>
-							<option value="<?php echo esc_attr( $id ); ?>" <?php selected( (string) $s['fallback_region'], (string) $id ); ?>><?php echo esc_html( $label ); ?></option>
-						<?php endforeach; ?>
-					</select>
-					<p class="description">Used for a new suburb when the region can’t be worked out.</p></td>
 				</tr>
 			</table>
 
@@ -1888,7 +1742,7 @@ final class PH_Smart_Location {
 			<table class="form-table" role="presentation">
 				<tr>
 					<th scope="row">Use Claude</th>
-					<td><label><input type="checkbox" name="use_claude" value="1" <?php checked( $s['use_claude'] ); ?>> Ask Claude for the suburb when OpenStreetMap has none, and for the region of a new suburb</label></td>
+					<td><label><input type="checkbox" name="use_claude" value="1" <?php checked( $s['use_claude'] ); ?>> Ask Claude for the suburb when OpenStreetMap has none</label></td>
 				</tr>
 				<tr>
 					<th scope="row"><label for="phsl-key">API key</label></th>

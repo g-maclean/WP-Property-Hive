@@ -1,26 +1,25 @@
-=== Property Hive Smart Location 3.0 ===
+=== Property Hive Smart Location 4.0 ===
 
-Assigns each property's suburb as a Location in a fixed City › Region › Suburb structure
-(levels 1, 2 and 3 - the depth Property Hive fully supports), and optionally fills neighbourhood
-and quarter custom fields.
+Assigns each property's suburb as a Property Hive Location, creating new suburbs as TOP-LEVEL
+Locations for the site to arrange in whatever hierarchy it wants. Optionally fills neighbourhood
+and quarter custom fields. Makes no assumptions about the Location hierarchy or its depth.
 
 How it decides
-1. Skip: the property already has a suburb, i.e. any level-3 Location (for example matched from
-   its address by the import add-on). No lookups.
+1. Skip: the property already has a Location known to be a suburb (see below), for example matched
+   from its address by the import add-on. No lookups.
 2. OpenStreetMap reverse lookup (coordinates; address search if none), max 1 request/second.
    The suburb is OSM's "suburb"; if OSM has none, Claude is asked.
-3. Existing suburbs (level-3 Locations) are matched by name, ignoring case/punctuation, preferring
-   one in the property's city. A new suburb is created under a REGION of the property's CITY:
-     city   = OSM city/town/village/municipality/county matched to a level-1 Location,
-              else the "Default city" setting, else the only city
-     region = the city's only region, else the one Claude chooses (it is given the regions and
-              the suburbs already in each), else the "Fallback region" setting,
-              else the property is held as "Needs region" - pick the region on the Results tab
-              and click "Create & assign".
-   Nothing is ever created deeper than level 3. Locations are only ever ADDED, never removed.
+3. An existing Location with that name is reused wherever it sits in the hierarchy (matched
+   ignoring case/punctuation; if several share the name, the one whose parent appears in the OSM
+   address wins). Otherwise a new top-level Location is created. Locations are only ever ADDED.
 4. Neighbourhood / quarter (optional, off by default): OSM's values are saved to their own custom
    fields (default _neighbourhood / _quarter), only when empty. OSM only, no Claude.
 A custom field can be used for the suburb instead of Locations.
+
+Known suburbs
+The option `phsl_suburb_terms` lists the Location ids Smart Location has matched or created as
+suburbs. Moving them around the hierarchy doesn't matter. Deleted Locations are removed from it.
+Upgrading from 3.x seeds it from the suburbs already assigned.
 
 Modes: Suggest only (default; review on the Results tab, Apply / Apply all) or Assign automatically.
 
@@ -32,7 +31,7 @@ re-applied straight afterwards from the property's saved list - no lookups. New 
 20 / 60 seconds per import run, the rest via the 10-minute cron (new properties only).
 
 Post meta (kept minimal)
-_phsl_status  assigned | suggested | review | not_found | retry | error | skipped
+_phsl_status  assigned | suggested | not_found | retry | error | skipped
 _phsl         flags: t (time), o (OSM result), a (Claude: used/unsure/error/nokey), src,
               l (Location ids assigned, for re-applying), n (retry count), v (pending suggestion)
 
