@@ -24,3 +24,10 @@
 .phsl-actions { white-space: nowrap; }
 .phsl-log-error td { color: #b32d2e; }
 .phsl-log-warning td { color: #996800; }
+.phsl-nowrap { white-space: nowrap; }
+.phsl-log details summary { cursor: pointer; color: #2271b1; font-size: 12px; }
+.phsl-log .phsl-pre { margin: 6px 0 0; max-height: 300px; }
+.phsl-short { width: 12em; }
+.phsl-pid { width: 8em; }
+.phsl-types th { width: 180px; }
+.phsl-retry { background: #fcefc7; color: #5c4400; }
