@@ -15,6 +15,8 @@ class PHSL_Organiser {
 
 	const PROPOSAL  = 'phsl_organise_proposal';
 	const UNDO      = 'phsl_organise_undo';
+	const INSTRUCTIONS = 'phsl_organise_instructions';
+	const MAX_INSTRUCTIONS = 3000;
 	const MAX_DEPTH = 3;
 	const MAX_TERMS = 2000;
 	const TAXONOMY  = 'location';
@@ -140,8 +142,10 @@ class PHSL_Organiser {
 			@set_time_limit( 660 ); // phpcs:ignore
 		}
 		$mode      = 'full' === ( $_POST['mode'] ?? '' ) ? 'full' : 'stragglers';
-		$allow_new = ! empty( $_POST['allow_new'] );
-		$result    = $this->generate( $mode, $allow_new );
+		$allow_new    = ! empty( $_POST['allow_new'] );
+		$instructions = self::clean_instructions( wp_unslash( $_POST['instructions'] ?? '' ) );
+		update_option( self::INSTRUCTIONS, $instructions, false ); // remembered for next time
+		$result = $this->generate( $mode, $allow_new, $instructions );
 		if ( is_wp_error( $result ) ) {
 			$this->plugin->log( 'error', 'Organise Locations: ' . $result->get_error_message() );
 			wp_send_json_error( array( 'message' => $result->get_error_message() ) );
@@ -154,7 +158,12 @@ class PHSL_Organiser {
 	 *
 	 * @return array|WP_Error The stored proposal.
 	 */
-	public function generate( $mode, $allow_new ) {
+	public static function clean_instructions( $text ) {
+		$text = trim( sanitize_textarea_field( (string) $text ) );
+		return function_exists( 'mb_substr' ) ? mb_substr( $text, 0, self::MAX_INSTRUCTIONS ) : substr( $text, 0, self::MAX_INSTRUCTIONS );
+	}
+
+	public function generate( $mode, $allow_new, $instructions = '' ) {
 		$terms = $this->load( true );
 		if ( ! $terms ) {
 			return new WP_Error( 'empty', 'There are no Locations to organise.' );
@@ -201,7 +210,10 @@ class PHSL_Organiser {
 				. ( $placed ? implode( "\n", array_map( $line, $placed ) ) : '(none)' )
 				. "\n\nUNPLACED Locations:\n" . implode( "\n", array_map( $line, $targets ) );
 		}
-		$prompt .= "\n\nAlso give a short summary (2-4 sentences) of the structure you chose and why.";
+		if ( '' !== $instructions ) {
+			$prompt .= "\n\nInstructions from the site owner about how they want their Locations organised. Follow them as closely as you can, as long as they don't break the rules above (at most 3 levels, never rename):\n<instructions>\n" . $instructions . "\n</instructions>";
+		}
+		$prompt .= "\n\nAlso give a short summary (2-4 sentences) of the structure you chose and why" . ( '' !== $instructions ? ', including how you followed the site owner\'s instructions and anything you could not do.' : '.' );
 
 		$schema = array(
 			'type'                 => 'object',
@@ -237,7 +249,7 @@ class PHSL_Organiser {
 			'additionalProperties' => false,
 		);
 
-		$this->plugin->log( 'info', sprintf( 'Organise Locations: asking Claude (%s, %d Locations, %d to place)', $mode, count( $terms ), count( $targets ) ) );
+		$this->plugin->log( 'info', sprintf( 'Organise Locations: asking Claude (%s, %d Locations, %d to place)', $mode, count( $terms ), count( $targets ) ), 0, '' !== $instructions ? array( 'instructions' => $instructions ) : array() );
 		$res = $this->plugin->claude_json( $prompt, $schema, 32000, 'medium', 600 );
 		if ( is_wp_error( $res ) ) {
 			return $res;
@@ -248,6 +260,7 @@ class PHSL_Organiser {
 			'time'          => time(),
 			'mode'          => $mode,
 			'summary'       => trim( (string) ( $res['data']['summary'] ?? '' ) ),
+			'instructions'  => $instructions,
 			'model'         => $res['model'],
 			'input_tokens'  => $res['input_tokens'],
 			'output_tokens' => $res['output_tokens'],
@@ -257,7 +270,7 @@ class PHSL_Organiser {
 			'info',
 			sprintf( 'Organise Locations: proposal with %d moves and %d new groupings (%d rejected)', count( $proposal['moves'] ), count( $proposal['groups'] ), count( $proposal['rejected'] ) ),
 			0,
-			array( 'summary' => $proposal['summary'], 'rejected' => $proposal['rejected'], 'model' => $res['model'], 'input_tokens' => $res['input_tokens'], 'output_tokens' => $res['output_tokens'] )
+			array( 'summary' => $proposal['summary'], 'instructions' => $instructions, 'rejected' => $proposal['rejected'], 'model' => $res['model'], 'input_tokens' => $res['input_tokens'], 'output_tokens' => $res['output_tokens'] )
 		);
 		return $proposal;
 	}
@@ -580,6 +593,11 @@ class PHSL_Organiser {
 					<label class="phsl-block"><input type="radio" name="phsl_org_mode" value="stragglers" checked> <strong>Place unplaced Locations</strong> – keep the existing structure and fit top-level Locations with nothing under them into it (run now and again)</label>
 					<label class="phsl-block"><input type="radio" name="phsl_org_mode" value="full"> <strong>Full reorganise</strong> – propose a structure for all Locations (e.g. after the initial import)</label>
 					<label class="phsl-block"><input type="checkbox" id="phsl-org-allow-new" checked> Allow new grouping Locations (e.g. a county or region) where they help</label>
+					<p class="phsl-org-instructions">
+						<label for="phsl-org-instructions"><strong>Instructions for Claude</strong> (optional)</label><br>
+						<textarea id="phsl-org-instructions" rows="5" class="large-text" maxlength="<?php echo (int) self::MAX_INSTRUCTIONS; ?>" placeholder="For example:&#10;Use our areas Birmingham North, Birmingham South, Birmingham East, Birmingham West and Birmingham Central under Birmingham, and put each suburb in the right one.&#10;Keep Solihull, Sutton Coldfield and Lichfield as their own top-level towns.&#10;Group villages under 'Rural' rather than by county."><?php echo esc_textarea( (string) get_option( self::INSTRUCTIONS, '' ) ); ?></textarea>
+						<span class="description">Sent with the Location data. Claude follows these where it can, but it still can’t go deeper than 3 levels, rename Locations or create loops. Remembered for next time.</span>
+					</p>
 					<button type="button" class="button button-primary" id="phsl-org-generate">Generate proposal</button>
 					<span id="phsl-org-status" class="description"></span>
 				</div>
@@ -623,6 +641,9 @@ class PHSL_Organiser {
 			<h2>Proposal (<?php echo 'full' === $proposal['mode'] ? 'full reorganise' : 'place unplaced Locations'; ?>)</h2>
 			<?php if ( $proposal['summary'] ) : ?>
 				<p><em><?php echo esc_html( $proposal['summary'] ); ?></em></p>
+			<?php endif; ?>
+			<?php if ( ! empty( $proposal['instructions'] ) ) : ?>
+				<details><summary>Instructions used</summary><pre class="phsl-pre"><?php echo esc_html( $proposal['instructions'] ); ?></pre></details>
 			<?php endif; ?>
 			<p class="description"><?php echo esc_html( sprintf( 'Made %s by %s (%s in / %s out tokens).', wp_date( 'j M Y H:i', $proposal['time'] ), $proposal['model'], number_format_i18n( $proposal['input_tokens'] ), number_format_i18n( $proposal['output_tokens'] ) ) ); ?></p>
 

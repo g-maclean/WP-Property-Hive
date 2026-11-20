@@ -40,3 +40,4 @@
 .phsl-tree-new { color: #00712e; font-weight: 600; }
 .phsl-list { list-style: disc; margin-left: 20px; }
 .phsl-org-moves .check-column { width: 2.2em; }
+.phsl-org-instructions { max-width: 900px; margin: 12px 0; }

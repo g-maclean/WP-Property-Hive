@@ -92,7 +92,8 @@ jQuery( function ( $ ) {
 			data: {
 				action: 'phsl_organise_generate', nonce: phsl.nonce,
 				mode: $( 'input[name=phsl_org_mode]:checked' ).val(),
-				allow_new: $( '#phsl-org-allow-new' ).is( ':checked' ) ? 1 : 0
+				allow_new: $( '#phsl-org-allow-new' ).is( ':checked' ) ? 1 : 0,
+				instructions: $( '#phsl-org-instructions' ).val() || ''
 			}
 		} ).done( function ( res ) {
 			if ( res && res.success ) {

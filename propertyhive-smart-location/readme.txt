@@ -1,4 +1,4 @@
-=== Property Hive Smart Location 1.3 ===
+=== Property Hive Smart Location 1.3.1 ===
 
 Assigns each property's suburb as a Property Hive Location, creating new suburbs as TOP-LEVEL
 Locations for the site to arrange in whatever hierarchy it wants. Optionally fills neighbourhood
@@ -28,6 +28,10 @@ districts) and proposes a hierarchy of at most 3 levels that suits the list - e.
 Suburb, County › Town › Suburb, City › Town › Suburb, or some left at the top level.
 - "Place unplaced Locations": keeps the existing structure and fits top-level Locations with nothing
   under them into it. "Full reorganise": proposes a structure for every Location.
+- Optional "Instructions for Claude" box: free-text guidance sent with the data (e.g. "use our
+  areas Birmingham North/South/East/West under Birmingham", "keep Solihull top level"). Followed
+  where possible within the rules (max 3 levels, no renaming, no loops - still enforced by the
+  plugin). Remembered for next time, shown with the proposal and logged. Max 3,000 characters.
 - May suggest new grouping Locations (each must hold 2+), unless switched off. A suggested grouping
   named like an existing Location uses that Location.
 - Proposals that would loop or go deeper than 3 levels are left out and listed.

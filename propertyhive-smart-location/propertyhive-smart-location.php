@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Property Hive Smart Location
  * Description: Assigns each property's suburb as a Location (creating new suburbs at the top level), optionally fills neighbourhood and quarter custom fields, and can organise Locations into a sensible hierarchy – using OpenStreetMap and Claude AI.
- * Version: 1.3
+ * Version: 1.3.1
  * Author: Property Hive
  * Requires at least: 5.6
  * Requires PHP: 7.2
@@ -18,7 +18,7 @@ require_once __DIR__ . '/includes/class-phsl-organiser.php';
 
 final class PH_Smart_Location {
 
-	const VERSION       = '1.3';
+	const VERSION       = '1.3.1';
 	const DB_VERSION    = '4';
 	const OPTION        = 'phsl_settings';
 	const PAGE_SLUG     = 'ph-smart-location';
