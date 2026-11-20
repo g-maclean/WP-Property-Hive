@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Property Hive Smart Location
- * Description: Assigns each property's suburb as a Location (creating new suburbs at the top level for you to arrange), and optionally fills neighbourhood and quarter custom fields, using OpenStreetMap with Claude AI as a fallback.
- * Version: 1.2
+ * Description: Assigns each property's suburb as a Location (creating new suburbs at the top level), optionally fills neighbourhood and quarter custom fields, and can organise Locations into a sensible hierarchy – using OpenStreetMap and Claude AI.
+ * Version: 1.3
  * Author: Property Hive
  * Requires at least: 5.6
  * Requires PHP: 7.2
@@ -14,10 +14,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 require_once __DIR__ . '/includes/class-phsl-logger.php';
+require_once __DIR__ . '/includes/class-phsl-organiser.php';
 
 final class PH_Smart_Location {
 
-	const VERSION       = '1.2';
+	const VERSION       = '1.3';
 	const DB_VERSION    = '4';
 	const OPTION        = 'phsl_settings';
 	const PAGE_SLUG     = 'ph-smart-location';
@@ -66,6 +67,9 @@ final class PH_Smart_Location {
 	private $term_index = null; // normalised name => term ids
 	private $last_osm   = array();
 
+	/** @var PHSL_Organiser */
+	public $organiser;
+
 	public static function instance() {
 		if ( null === self::$instance ) {
 			self::$instance = new self();
@@ -92,6 +96,8 @@ final class PH_Smart_Location {
 
 		add_action( 'wp_ajax_phsl_step', array( $this, 'ajax_step' ) );
 		add_action( 'wp_ajax_phsl_test', array( $this, 'ajax_test' ) );
+
+		$this->organiser = new PHSL_Organiser( $this );
 
 		foreach ( array( 'save_settings', 'apply', 'apply_all', 'retry', 'requeue', 'clear_log', 'download_log' ) as $action ) {
 			add_action( 'admin_post_phsl_' . $action, array( $this, 'handle_' . $action ) );
@@ -1159,7 +1165,60 @@ final class PH_Smart_Location {
 		);
 	}
 
-	private function claude_request( $body, $use_fallbacks ) {
+	/**
+	 * General structured request to Claude, returning decoded JSON matching $schema.
+	 * Used by the Location organiser.
+	 *
+	 * @return array|WP_Error array( data, model, input_tokens, output_tokens )
+	 */
+	public function claude_json( $prompt, $schema, $max_tokens = 4000, $effort = 'low', $timeout = 90 ) {
+		if ( ! self::claude_enabled() ) {
+			return new WP_Error( 'claude_disabled', 'Claude is not enabled or there is no API key (Settings → Claude).' );
+		}
+		$s    = self::settings();
+		$body = array(
+			'model'         => $s['claude_model'],
+			'max_tokens'    => (int) $max_tokens,
+			'output_config' => array(
+				'effort' => $effort,
+				'format' => array( 'type' => 'json_schema', 'schema' => $schema ),
+			),
+			'messages'      => array( array( 'role' => 'user', 'content' => $prompt ) ),
+		);
+		$fallbacks = 'claude-haiku-5-5' !== $s['claude_model'];
+		$response  = $this->claude_request( $body, $fallbacks, $timeout );
+		if ( is_wp_error( $response ) && $fallbacks && 'claude_http_400' === $response->get_error_code() ) {
+			$response = $this->claude_request( $body, false, $timeout );
+		}
+		if ( is_wp_error( $response ) ) {
+			return $response;
+		}
+		$stop = $response['stop_reason'] ?? '';
+		if ( 'refusal' === $stop ) {
+			return new WP_Error( 'claude_refusal', 'Claude declined the request.' );
+		}
+		if ( 'max_tokens' === $stop ) {
+			return new WP_Error( 'claude_too_long', 'Claude’s answer was cut off because it was too long.' );
+		}
+		$text = '';
+		foreach ( (array) ( $response['content'] ?? array() ) as $block ) {
+			if ( 'text' === ( $block['type'] ?? '' ) ) {
+				$text .= $block['text'];
+			}
+		}
+		$data = json_decode( $text, true );
+		if ( ! is_array( $data ) ) {
+			return new WP_Error( 'claude_bad_output', 'Unexpected answer from Claude (stop reason: ' . $stop . ').' );
+		}
+		return array(
+			'data'          => $data,
+			'model'         => $response['model'] ?? $s['claude_model'],
+			'input_tokens'  => (int) ( $response['usage']['input_tokens'] ?? 0 ),
+			'output_tokens' => (int) ( $response['usage']['output_tokens'] ?? 0 ),
+		);
+	}
+
+	private function claude_request( $body, $use_fallbacks, $timeout = 90 ) {
 		$headers = array(
 			'content-type'      => 'application/json',
 			'x-api-key'         => self::api_key(),
@@ -1169,7 +1228,7 @@ final class PH_Smart_Location {
 			$headers['anthropic-beta'] = 'server-side-fallback-2026-07-01';
 			$body['fallbacks']         = 'default';
 		}
-		$response = wp_remote_post( self::ANTHROPIC_URL, array( 'timeout' => 90, 'headers' => $headers, 'body' => wp_json_encode( $body ) ) );
+		$response = wp_remote_post( self::ANTHROPIC_URL, array( 'timeout' => $timeout, 'headers' => $headers, 'body' => wp_json_encode( $body ) ) );
 		if ( is_wp_error( $response ) ) {
 			return new WP_Error( 'claude_request_failed', 'could not reach the API: ' . $response->get_error_message() );
 		}
@@ -1362,7 +1421,7 @@ final class PH_Smart_Location {
 		return apply_filters( 'phsl_capability', 'manage_propertyhive' );
 	}
 
-	private function user_can() {
+	public function user_can() {
 		return current_user_can( self::capability() ) || current_user_can( 'manage_options' );
 	}
 
@@ -1379,16 +1438,16 @@ final class PH_Smart_Location {
 		wp_localize_script( 'phsl-admin', 'phsl', array( 'ajaxUrl' => admin_url( 'admin-ajax.php' ), 'nonce' => wp_create_nonce( self::NONCE ) ) );
 	}
 
-	private static function page_url( $tab = 'run', $args = array() ) {
+	public static function page_url( $tab = 'run', $args = array() ) {
 		return add_query_arg( array_merge( array( 'page' => self::PAGE_SLUG, 'tab' => $tab ), $args ), admin_url( class_exists( 'PropertyHive' ) ? 'admin.php' : 'tools.php' ) );
 	}
 
-	private function redirect( $tab, $msg ) {
+	public function redirect( $tab, $msg ) {
 		wp_safe_redirect( self::page_url( $tab, array( 'phsl_msg' => $msg ) ) );
 		exit;
 	}
 
-	private function post_button( $action, $label, $fields = array(), $class = 'button', $confirm = '' ) {
+	public function post_button( $action, $label, $fields = array(), $class = 'button', $confirm = '' ) {
 		printf( '<form method="post" action="%s" class="phsl-inline"%s>', esc_url( admin_url( 'admin-post.php' ) ), $confirm ? ' onsubmit="return confirm(\'' . esc_js( $confirm ) . '\');"' : '' );
 		echo '<input type="hidden" name="action" value="' . esc_attr( $action ) . '">';
 		foreach ( $fields as $k => $v ) {
@@ -1402,7 +1461,7 @@ final class PH_Smart_Location {
 		if ( ! $this->user_can() ) {
 			wp_die( 'Sorry, you are not allowed to access this page.' );
 		}
-		$tabs = array( 'run' => 'Overview', 'results' => 'Results', 'log' => 'Log', 'settings' => 'Settings' );
+		$tabs = array( 'run' => 'Overview', 'results' => 'Results', 'organise' => 'Organise Locations', 'log' => 'Log', 'settings' => 'Settings' );
 		$tab  = sanitize_key( $_GET['tab'] ?? 'run' );
 		$tab  = isset( $tabs[ $tab ] ) ? $tab : 'run';
 		$msgs = array(
@@ -1411,6 +1470,10 @@ final class PH_Smart_Location {
 			'retry'          => 'Property queued to be processed again.',
 			'requeued'       => 'Properties re-queued.',
 			'log_cleared'    => 'Log files deleted.',
+			'organised'      => 'Location changes applied. Use “Undo last apply” to reverse them.',
+			'organise_undone' => 'Last organise undone.',
+			'organise_discarded' => 'Proposal discarded.',
+			'organise_nothing' => 'Nothing was selected.',
 			'apply_failed'   => 'Could not apply – see the Log for the reason.',
 		);
 		echo '<div class="wrap phsl-wrap"><h1>Smart Location</h1>';
@@ -1423,7 +1486,11 @@ final class PH_Smart_Location {
 			printf( '<a href="%s" class="nav-tab%s">%s</a>', esc_url( self::page_url( $k ) ), $k === $tab ? ' nav-tab-active' : '', esc_html( $label ) );
 		}
 		echo '</nav>';
-		call_user_func( array( $this, 'render_' . $tab ) );
+		if ( 'organise' === $tab ) {
+			$this->organiser->render();
+		} else {
+			call_user_func( array( $this, 'render_' . $tab ) );
+		}
 		echo '</div>';
 	}
 
@@ -1800,14 +1867,14 @@ final class PH_Smart_Location {
 		PHSL_Logger::write( $level, $message, $property_id, $context );
 	}
 
-	private function check_ajax() {
+	public function check_ajax() {
 		check_ajax_referer( self::NONCE, 'nonce' );
 		if ( ! $this->user_can() ) {
 			wp_send_json_error( array( 'message' => 'Permission denied' ), 403 );
 		}
 	}
 
-	private function check_admin_request( $action ) {
+	public function check_admin_request( $action ) {
 		check_admin_referer( $action );
 		if ( ! $this->user_can() ) {
 			wp_die( 'Permission denied' );

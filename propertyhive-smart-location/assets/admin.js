@@ -82,4 +82,33 @@ jQuery( function ( $ ) {
 			.fail( function ( xhr ) { $out.text( 'Request failed: HTTP ' + xhr.status ); } )
 			.always( function () { $btn.prop( 'disabled', false ); } );
 	} );
+	// Organise Locations
+	$( '#phsl-org-generate' ).on( 'click', function () {
+		var $btn = $( this ), $status = $( '#phsl-org-status' );
+		$btn.prop( 'disabled', true );
+		$status.text( 'Asking Claude… this can take a minute or two. Please keep this page open.' );
+		$.ajax( {
+			url: phsl.ajaxUrl, method: 'POST', dataType: 'json', timeout: 700000,
+			data: {
+				action: 'phsl_organise_generate', nonce: phsl.nonce,
+				mode: $( 'input[name=phsl_org_mode]:checked' ).val(),
+				allow_new: $( '#phsl-org-allow-new' ).is( ':checked' ) ? 1 : 0
+			}
+		} ).done( function ( res ) {
+			if ( res && res.success ) {
+				$status.text( 'Done – loading the proposal…' );
+				window.location.reload();
+			} else {
+				$status.text( 'Failed: ' + ( res && res.data && res.data.message ? res.data.message : 'unexpected response' ) );
+				$btn.prop( 'disabled', false );
+			}
+		} ).fail( function ( xhr, status ) {
+			$status.text( 'Request failed (' + ( xhr.status || status ) + '). If the server timed out, try “Place unplaced Locations”, or see the Log.' );
+			$btn.prop( 'disabled', false );
+		} );
+	} );
+
+	$( '#phsl-org-all' ).on( 'change', function () {
+		$( '.phsl-org-moves input[name="move[]"]' ).prop( 'checked', $( this ).is( ':checked' ) );
+	} );
 } );

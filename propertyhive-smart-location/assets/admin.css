@@ -32,3 +32,11 @@
 .phsl-types th { width: 180px; }
 .phsl-retry { background: #fcefc7; color: #5c4400; }
 .phsl-flush { padding-left: 0; }
+.phsl-tree { max-height: 600px; overflow: auto; background: #f6f7f7; padding: 8px 16px; }
+.phsl-tree ul { margin: 2px 0 2px 18px; list-style: disc; }
+.phsl-tree > ul { margin-left: 4px; list-style: none; }
+.phsl-tree li { margin: 1px 0; }
+.phsl-tree-moved { color: #0a3d6b; font-weight: 600; }
+.phsl-tree-new { color: #00712e; font-weight: 600; }
+.phsl-list { list-style: disc; margin-left: 20px; }
+.phsl-org-moves .check-column { width: 2.2em; }

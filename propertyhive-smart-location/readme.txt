@@ -1,4 +1,4 @@
-=== Property Hive Smart Location 1.2 ===
+=== Property Hive Smart Location 1.3 ===
 
 Assigns each property's suburb as a Property Hive Location, creating new suburbs as TOP-LEVEL
 Locations for the site to arrange in whatever hierarchy it wants. Optionally fills neighbourhood
@@ -20,6 +20,22 @@ Known suburbs
 The option `phsl_suburb_terms` lists the Location ids Smart Location has matched or created as
 suburbs. Moving them around the hierarchy doesn't matter. Deleted Locations are removed from it.
 Upgrading from an earlier build seeds it from the suburbs already assigned.
+
+Organise Locations (tab)
+A separate, manual process for after an import and now and again afterwards. Claude is given every
+Location (name, current parent, number of properties and those properties' most common postcode
+districts) and proposes a hierarchy of at most 3 levels that suits the list - e.g. Region › City ›
+Suburb, County › Town › Suburb, City › Town › Suburb, or some left at the top level.
+- "Place unplaced Locations": keeps the existing structure and fits top-level Locations with nothing
+  under them into it. "Full reorganise": proposes a structure for every Location.
+- May suggest new grouping Locations (each must hold 2+), unless switched off. A suggested grouping
+  named like an existing Location uses that Location.
+- Proposals that would loop or go deeper than 3 levels are left out and listed.
+- Review the proposed tree and the list of moves; untick any; "Apply selected". Locations are only
+  re-parented or created - never renamed or deleted. "Undo last apply" restores the previous
+  parents and removes created groupings that are still empty. Everything is logged.
+- Uses the configured Claude model at medium effort; long requests (up to 10 minutes) - if the
+  server times out, use "Place unplaced Locations" which sends less.
 
 Modes: Suggest only (default; review on the Results tab, Apply / Apply all) or Assign automatically.
 
