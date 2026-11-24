@@ -41,3 +41,9 @@
 .phsl-list { list-style: disc; margin-left: 20px; }
 .phsl-org-moves .check-column { width: 2.2em; }
 .phsl-org-instructions { max-width: 900px; margin: 12px 0; }
+.phsl-cmp-match { background: #d1f0dc; color: #00451c; }
+.phsl-cmp-near-match, .phsl-cmp-partial-match { background: #dbe9f6; color: #0a3d6b; }
+.phsl-cmp-mismatch { background: #f8d7d7; color: #6e1414; }
+.phsl-cmp-smart-only { background: #e5dcf5; color: #3b1f6b; }
+.phsl-cmp-manual-only { background: #fcefc7; color: #5c4400; }
+.phsl-compare { max-width: 820px; }

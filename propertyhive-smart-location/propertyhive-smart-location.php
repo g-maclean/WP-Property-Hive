@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Property Hive Smart Location
- * Description: Assigns each property's suburb as a Location (creating new suburbs at the top level), optionally fills neighbourhood and quarter custom fields, and can organise Locations into a sensible hierarchy – using OpenStreetMap and Claude AI.
- * Version: 1.3.1
+ * Description: Fills a "smart suburb" field for each property using OpenStreetMap, with Claude AI as a fallback, compares it with the manually entered suburb, and can organise Location terms into a sensible hierarchy.
+ * Version: 1.4
  * Author: Property Hive
  * Requires at least: 5.6
  * Requires PHP: 7.2
@@ -18,38 +18,31 @@ require_once __DIR__ . '/includes/class-phsl-organiser.php';
 
 final class PH_Smart_Location {
 
-	const VERSION       = '1.3.1';
-	const DB_VERSION    = '4';
+	const VERSION       = '1.4';
+	const DB_VERSION    = '5';
 	const OPTION        = 'phsl_settings';
 	const PAGE_SLUG     = 'ph-smart-location';
 	const NONCE         = 'phsl_nonce';
 	const LOCK_OPTION   = 'phsl_lock';
 	const CRON_HOOK     = 'phsl_cron';
-	const TAXONOMY      = 'location';
 	const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 	const API_VERSION   = '2026-10-21';
 
 	/**
-	 * The only two post meta keys the plugin writes.
+	 * The plugin writes the suburb to its own field (default "smart_suburb"); it never touches the
+	 * Location taxonomy or the manually entered suburb. Fields are only filled when empty, so a
+	 * value someone edits by hand is never overwritten.
 	 *
+	 * Tracking uses two small post meta keys:
 	 * _phsl_status: assigned | suggested | not_found | error | skipped | retry
-	 * _phsl:        small array of flags:
-	 *   t    unix time of the last attempt
-	 *   o    OpenStreetMap: 1 = suburb found, 0 = looked up, no suburb, x = request failed
-	 *   a    Claude: used | unsure | error | nokey – absent if not needed / disabled
-	 *   src  where the suburb came from (osm:suburb, claude)
-	 *   l    Location term ids Smart Location assigned (re-applied if an import removes them)
-	 *   n    transient-failure count (while status is "retry")
-	 *   v    pending suggestion: array( n => suburb, t => existing term id or 0 (new), nb => neighbourhood, q => quarter )
+	 * _phsl:        flags: t (time), o (OSM: 1 suburb found / 0 none / x failed),
+	 *               a (Claude: used | unsure | error | nokey), src (osm:suburb | claude),
+	 *               cf (Claude confidence), n (retry count),
+	 *               v (pending suggestion: n => suburb, nb => neighbourhood, q => quarter)
 	 * Everything else goes to the log file.
-	 *
-	 * The option phsl_suburb_terms lists the Location ids known to be suburbs (matched or created by
-	 * Smart Location). A property that already has one of them needs no lookup. Where Locations sit in
-	 * the hierarchy is entirely up to the site: new suburbs are created at the top level.
 	 */
 	const META_STATUS = '_phsl_status';
 	const META_STATE  = '_phsl';
-	const SUBURBS_OPTION = 'phsl_suburb_terms';
 
 	/** OSM area fields passed to Claude as context and logged. */
 	public static $osm_context_fields = array( 'neighbourhood', 'suburb', 'quarter', 'residential', 'hamlet', 'village', 'borough', 'city_district', 'town', 'city', 'county' );
@@ -60,12 +53,22 @@ final class PH_Smart_Location {
 		'claude-haiku-5-5'  => 'Claude Haiku 5.5 (cheapest)',
 	);
 
+	/** Comparison values, in display order, with descriptions. */
+	public static $comparisons = array(
+		'match'         => 'Same suburb (ignoring case and punctuation), or one of several manual values',
+		'near match'    => 'Same apart from a small spelling difference',
+		'partial match' => 'One name contains the other, e.g. “Harborne” / “Harborne Village”',
+		'mismatch'      => 'Both filled in, and different',
+		'smart only'    => 'No manual suburb; a smart suburb was found',
+		'manual only'   => 'Looked up, but no smart suburb was found',
+		'not checked'   => 'Not looked up yet',
+		'both empty'    => 'Neither has a value',
+	);
+
 	private static $instance = null;
 
-	private $vocab      = null;
-	private $terms      = null; // term_id => WP_Term
-	private $term_index = null; // normalised name => term ids
-	private $last_osm   = array();
+	private $vocab    = null;
+	private $last_osm = array();
 
 	/** @var PHSL_Organiser */
 	public $organiser;
@@ -89,8 +92,6 @@ final class PH_Smart_Location {
 			add_action( $hook, array( $this, 'on_imported' ), 20, 1 );
 		}
 
-		add_action( 'delete_term', array( $this, 'on_delete_term' ), 10, 3 );
-
 		add_action( 'admin_init', array( $this, 'maybe_upgrade' ) );
 		add_action( 'admin_menu', array( $this, 'admin_menu' ), 99 );
 
@@ -99,7 +100,7 @@ final class PH_Smart_Location {
 
 		$this->organiser = new PHSL_Organiser( $this );
 
-		foreach ( array( 'save_settings', 'apply', 'apply_all', 'retry', 'requeue', 'clear_log', 'download_log' ) as $action ) {
+		foreach ( array( 'save_settings', 'apply', 'apply_all', 'retry', 'requeue', 'export', 'clear_log', 'download_log' ) as $action ) {
 			add_action( 'admin_post_phsl_' . $action, array( $this, 'handle_' . $action ) );
 		}
 	}
@@ -128,31 +129,20 @@ final class PH_Smart_Location {
 		global $wpdb;
 		$version = get_option( 'phsl_db_version' );
 		if ( $version && version_compare( $version, '2', '<' ) ) {
-			// 1.x kept a database log and verbose post meta.
+			// The first builds kept a database log and verbose post meta.
 			$wpdb->query( "DROP TABLE IF EXISTS {$wpdb->prefix}phsl_log" ); // phpcs:ignore
 			$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->postmeta} WHERE meta_key IN (%s, %s, %s, %s)", '_phsl_status', '_phsl_result', '_phsl_attempted', '_phsl_tries' ) );
 		}
-		if ( $version && version_compare( $version, '4', '<' ) ) {
-			// 2.x kept an option of suburb/neighbourhood/quarter Locations; 3.x identified suburbs by depth.
-			// Now one list of suburb Locations: seed it from the 2.x suburbs and everything already assigned.
-			$ids   = array();
-			$types = get_option( 'phsl_location_types', array() );
-			if ( ! empty( $types['suburb'] ) ) {
-				$ids = array_map( 'intval', (array) $types['suburb'] );
-			}
-			foreach ( $wpdb->get_col( $wpdb->prepare( "SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_key = %s", self::META_STATE ) ) as $raw ) {
-				$state = maybe_unserialize( $raw );
-				if ( is_array( $state ) && ! empty( $state['l'] ) ) {
-					$ids = array_merge( $ids, array_map( 'intval', (array) $state['l'] ) );
-				}
-			}
+		if ( $version && version_compare( $version, '5', '<' ) ) {
+			// Earlier builds assigned the Location taxonomy. The suburb now goes to its own field,
+			// so forget the old Location tracking and look properties up again for that field.
+			// (Locations assigned or created by earlier builds are left exactly as they are.)
 			delete_option( 'phsl_location_types' );
-			$this->add_suburb_terms( $ids );
-			// 3.x "needs region" reviews no longer exist: process those properties again.
-			$n = $this->requeue( function ( $status ) {
-				return 'review' === $status;
+			delete_option( 'phsl_suburb_terms' );
+			$n = $this->requeue( function () {
+				return true;
 			} );
-			$this->log( 'info', sprintf( 'Upgraded data: new suburbs are created at the top level; %d known suburb Locations; %d properties awaiting a region re-queued.', count( self::suburb_term_ids() ), $n ) );
+			$this->log( 'info', sprintf( 'Upgraded: the suburb is now saved to the smart suburb field, not Locations. %d properties re-queued.', $n ) );
 		}
 		if ( self::DB_VERSION !== $version ) {
 			update_option( 'phsl_db_version', self::DB_VERSION, false );
@@ -177,9 +167,8 @@ final class PH_Smart_Location {
 			'on_import'             => 1,
 			'auto_new'              => 1,
 			'statuses'              => array( 'publish' ),
-			'suburb_target'         => 'taxonomy',
-			'suburb_key'            => '_suburb',
-			'create_terms'          => 1,
+			'smart_key'             => 'smart_suburb',
+			'manual_key'            => '_suburb',
 			'neighbourhood_enabled' => 0,
 			'neighbourhood_key'     => '_neighbourhood',
 			'quarter_enabled'       => 0,
@@ -205,14 +194,7 @@ final class PH_Smart_Location {
 		if ( ! isset( self::$models[ $s['claude_model'] ] ) ) {
 			$s['claude_model'] = 'claude-opus-5-5';
 		}
-		if ( 'meta' !== $s['suburb_target'] ) {
-			$s['suburb_target'] = 'taxonomy';
-		}
 		return $s;
-	}
-
-	private static function uses_taxonomy() {
-		return 'taxonomy' === self::settings()['suburb_target'];
 	}
 
 	/** Enabled extra custom fields: OSM field => meta key. */
@@ -262,9 +244,8 @@ final class PH_Smart_Location {
 			'on_import'             => empty( $p['on_import'] ) ? 0 : 1,
 			'auto_new'              => empty( $p['auto_new'] ) ? 0 : 1,
 			'statuses'              => $statuses ? $statuses : array( 'publish' ),
-			'suburb_target'         => 'meta' === ( $p['suburb_target'] ?? '' ) ? 'meta' : 'taxonomy',
-			'suburb_key'            => self::sanitize_meta_key( $p['suburb_key'] ?? '_suburb', '_suburb' ),
-			'create_terms'          => empty( $p['create_terms'] ) ? 0 : 1,
+			'smart_key'             => self::sanitize_meta_key( $p['smart_key'] ?? 'smart_suburb', 'smart_suburb' ),
+			'manual_key'            => self::sanitize_meta_key( $p['manual_key'] ?? '_suburb', '_suburb' ),
 			'neighbourhood_enabled' => empty( $p['neighbourhood_enabled'] ) ? 0 : 1,
 			'neighbourhood_key'     => self::sanitize_meta_key( $p['neighbourhood_key'] ?? '_neighbourhood', '_neighbourhood' ),
 			'quarter_enabled'       => empty( $p['quarter_enabled'] ) ? 0 : 1,
@@ -354,135 +335,71 @@ final class PH_Smart_Location {
 		return is_numeric( $value ) ? (float) $value : null;
 	}
 
-	/* ---------- Known suburb Locations (wp_options) ---------- */
-
-	/** @return int[] Location ids known to be suburbs. */
-	public static function suburb_term_ids() {
-		return array_values( array_unique( array_map( 'intval', (array) get_option( self::SUBURBS_OPTION, array() ) ) ) );
-	}
-
-	private function add_suburb_terms( $ids ) {
-		$current = self::suburb_term_ids();
-		$merged  = array_values( array_unique( array_merge( $current, array_filter( array_map( 'intval', (array) $ids ) ) ) ) );
-		if ( count( $merged ) !== count( $current ) ) {
-			update_option( self::SUBURBS_OPTION, $merged, true );
-		}
-	}
-
-	/** Keep the list tidy when a Location is deleted. */
-	public function on_delete_term( $term_id, $tt_id, $taxonomy ) {
-		if ( self::TAXONOMY !== $taxonomy ) {
-			return;
-		}
-		$ids = self::suburb_term_ids();
-		if ( in_array( (int) $term_id, $ids, true ) ) {
-			update_option( self::SUBURBS_OPTION, array_values( array_diff( $ids, array( (int) $term_id ) ) ), true );
-		}
-	}
-
-	/* ---------- Location terms ---------- */
-
-	private function load_terms() {
-		if ( null !== $this->terms ) {
-			return;
-		}
-		$this->terms      = array();
-		$this->term_index = array();
-		$terms            = get_terms( array( 'taxonomy' => self::TAXONOMY, 'hide_empty' => false ) );
-		if ( is_wp_error( $terms ) ) {
-			return;
-		}
-		foreach ( $terms as $t ) {
-			$this->terms[ (int) $t->term_id ]                  = $t;
-			$this->term_index[ self::normalise( $t->name ) ][] = (int) $t->term_id;
-		}
-		/** Aliases: array( 'name OSM/Claude uses' => term_id ). */
-		foreach ( (array) apply_filters( 'phsl_location_aliases', array() ) as $alias => $term_id ) {
-			$this->term_index[ self::normalise( $alias ) ][] = (int) $term_id;
-		}
-	}
-
-	private function forget_terms() {
-		$this->terms      = null;
-		$this->term_index = null;
-	}
-
-	private function term_ancestors( $term_id ) {
-		$out   = array();
-		$guard = 0;
-		while ( isset( $this->terms[ $term_id ] ) && $this->terms[ $term_id ]->parent && $guard++ < 20 ) {
-			$term_id = (int) $this->terms[ $term_id ]->parent;
-			$out[]   = $term_id;
-		}
-		return $out;
-	}
-
-	public function term_path( $term_id ) {
-		$this->load_terms();
-		$names = array();
-		foreach ( array_reverse( array_merge( array( (int) $term_id ), $this->term_ancestors( $term_id ) ) ) as $id ) {
-			if ( isset( $this->terms[ $id ] ) ) {
-				$names[] = $this->terms[ $id ]->name;
-			}
-		}
-		return implode( ' › ', $names );
-	}
-
 	/**
-	 * Find an existing Location by name, anywhere in the hierarchy. Where several share a name
-	 * (e.g. "Newtown" in two towns), prefer the one whose parent appears in the OSM address.
+	 * Compare the manually entered suburb(s) with the smart suburb.
+	 *
+	 * @param string[] $manual   Manual values (the field may hold several, comma separated).
+	 * @param string   $smart    Smart suburb (saved, or a pending suggestion).
+	 * @param bool     $checked  Whether the property has been looked up.
+	 * @return string One of the keys of self::$comparisons.
 	 */
-	private function find_term( $name, $address = array() ) {
-		$this->load_terms();
-		$key = self::normalise( $name );
-		if ( '' === $key || empty( $this->term_index[ $key ] ) ) {
-			return 0;
-		}
-		$ids = array_values( array_unique( $this->term_index[ $key ] ) );
-		if ( count( $ids ) > 1 ) {
-			$context = array();
-			foreach ( self::$osm_context_fields as $f ) {
-				if ( ! empty( $address[ $f ] ) && is_string( $address[ $f ] ) ) {
-					$context[] = self::normalise( $address[ $f ] );
-				}
+	public static function compare( $manual, $smart, $checked ) {
+		$manual = array_values( array_filter( array_map( array( __CLASS__, 'normalise' ), (array) $manual ) ) );
+		$smart  = self::normalise( $smart );
+		if ( '' === $smart ) {
+			if ( ! $checked ) {
+				return 'not checked';
 			}
-			foreach ( $ids as $id ) {
-				foreach ( $this->term_ancestors( $id ) as $a ) {
-					if ( isset( $this->terms[ $a ] ) && in_array( self::normalise( $this->terms[ $a ]->name ), $context, true ) ) {
-						return $id;
+			return $manual ? 'manual only' : 'both empty';
+		}
+		if ( ! $manual ) {
+			return 'smart only';
+		}
+		if ( in_array( $smart, $manual, true ) ) {
+			return 'match';
+		}
+		// Small spelling slips only: 1 character for shorter names, 2 for 10+ letters
+		// ("Stirchly", "Northfeild"), never different words ("Selly Oak" vs "Selly Park").
+		foreach ( $manual as $m ) {
+			$a   = str_replace( ' ', '', $m );
+			$b   = str_replace( ' ', '', $smart );
+			$len = min( strlen( $a ), strlen( $b ) );
+			if ( $a === $b || ( $len >= 5 && levenshtein( $a, $b ) <= ( $len >= 10 ? 2 : 1 ) ) ) {
+				return 'near match';
+			}
+		}
+		foreach ( $manual as $m ) {
+			if ( false !== strpos( ' ' . $m . ' ', ' ' . $smart . ' ' ) || false !== strpos( ' ' . $smart . ' ', ' ' . $m . ' ' ) ) {
+				return 'partial match';
+			}
+		}
+		return 'mismatch';
+	}
+
+	/** Spellings already used for suburbs (manual field first, then smart field): normalised => spelling. */
+	private function vocab() {
+		global $wpdb;
+		if ( null !== $this->vocab ) {
+			return $this->vocab;
+		}
+		$s     = self::settings();
+		$vocab = array();
+		foreach ( array( $s['manual_key'], $s['smart_key'] ) as $key ) {
+			$raws = $wpdb->get_col( $wpdb->prepare( "SELECT DISTINCT pm.meta_value FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id WHERE pm.meta_key = %s AND p.post_type = 'property' AND pm.meta_value <> ''", $key ) );
+			foreach ( (array) $raws as $raw ) {
+				foreach ( self::split_values( $raw ) as $v ) {
+					$n = self::normalise( $v );
+					if ( '' !== $n && ! isset( $vocab[ $n ] ) ) {
+						$vocab[ $n ] = $v;
 					}
 				}
 			}
 		}
-		return $ids[0];
+		return $this->vocab = $vocab;
 	}
 
-	/** Create a new suburb Location at the top level; the site arranges its hierarchy. */
-	private function create_term( $name ) {
-		$r = wp_insert_term( $name, self::TAXONOMY, array( 'parent' => 0 ) );
-		if ( is_wp_error( $r ) ) {
-			if ( 'term_exists' === $r->get_error_code() && $r->get_error_data() ) {
-				return (int) $r->get_error_data();
-			}
-			return $r;
-		}
-		$this->forget_terms();
-		return (int) $r['term_id'];
-	}
-
-	/* ---------- Current values on a property ---------- */
-
-	private function assigned_term_ids( $property_id ) {
-		$ids = wp_get_object_terms( $property_id, self::TAXONOMY, array( 'fields' => 'ids' ) );
-		return is_wp_error( $ids ) ? array() : array_map( 'intval', $ids );
-	}
-
-	/** Location mode: the property has none of the Locations known to be suburbs. */
-	private function suburb_is_empty( $property_id ) {
-		if ( self::uses_taxonomy() ) {
-			return ! array_intersect( $this->assigned_term_ids( $property_id ), self::suburb_term_ids() );
-		}
-		return ! self::meta_values( $property_id, self::settings()['suburb_key'] );
+	private function smart_is_empty( $property_id ) {
+		return ! self::meta_values( $property_id, self::settings()['smart_key'] );
 	}
 
 	/** Extra custom fields (neighbourhood, quarter) that are enabled and still empty: OSM field => meta key. */
@@ -497,33 +414,7 @@ final class PH_Smart_Location {
 	}
 
 	private function needs_work( $property_id ) {
-		return $this->suburb_is_empty( $property_id ) || $this->empty_extra_fields( $property_id );
-	}
-
-	private function current_suburb_label( $property_id ) {
-		if ( ! self::uses_taxonomy() ) {
-			return implode( ', ', self::meta_values( $property_id, self::settings()['suburb_key'] ) );
-		}
-		return implode( ', ', array_map( array( $this, 'term_path' ), $this->assigned_term_ids( $property_id ) ) );
-	}
-
-	/** Suburbs already used, normalised => spelling (custom field mode). */
-	private function meta_vocab() {
-		global $wpdb;
-		if ( null !== $this->vocab ) {
-			return $this->vocab;
-		}
-		$vocab = array();
-		$raws  = $wpdb->get_col( $wpdb->prepare( "SELECT DISTINCT pm.meta_value FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id WHERE pm.meta_key = %s AND p.post_type = 'property' AND pm.meta_value <> ''", self::settings()['suburb_key'] ) );
-		foreach ( $raws as $raw ) {
-			foreach ( self::split_values( $raw ) as $v ) {
-				$n = self::normalise( $v );
-				if ( '' !== $n && ! isset( $vocab[ $n ] ) ) {
-					$vocab[ $n ] = $v;
-				}
-			}
-		}
-		return $this->vocab = $vocab;
+		return $this->smart_is_empty( $property_id ) || $this->empty_extra_fields( $property_id );
 	}
 
 	/* =====================================================================
@@ -565,25 +456,13 @@ final class PH_Smart_Location {
 	 * Candidates
 	 * =================================================================== */
 
-	private function suburb_empty_sql() {
-		global $wpdb;
-		if ( self::uses_taxonomy() ) {
-			$ids = self::suburb_term_ids();
-			if ( ! $ids ) {
-				return '1=1';
-			}
-			return $wpdb->prepare( "NOT EXISTS (SELECT 1 FROM {$wpdb->term_relationships} tr INNER JOIN {$wpdb->term_taxonomy} tt ON tt.term_taxonomy_id = tr.term_taxonomy_id WHERE tr.object_id = p.ID AND tt.taxonomy = %s AND tt.term_id IN (" . implode( ',', array_map( 'intval', $ids ) ) . '))', self::TAXONOMY ); // phpcs:ignore
-		}
-		return $this->meta_empty_sql( self::settings()['suburb_key'] );
-	}
-
 	private function meta_empty_sql( $key ) {
 		global $wpdb;
 		return $wpdb->prepare( "NOT EXISTS (SELECT 1 FROM {$wpdb->postmeta} em WHERE em.post_id = p.ID AND em.meta_key = %s AND em.meta_value <> '' AND em.meta_value <> 'a:0:{}')", $key );
 	}
 
 	private function needs_sql() {
-		$parts = array( $this->suburb_empty_sql() );
+		$parts = array( $this->meta_empty_sql( self::settings()['smart_key'] ) );
 		foreach ( self::extra_fields() as $key ) {
 			$parts[] = $this->meta_empty_sql( $key );
 		}
@@ -617,12 +496,53 @@ final class PH_Smart_Location {
 		global $wpdb;
 		$scope = $this->scope_sql();
 		$out   = array(
-			'total'          => (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} p WHERE {$scope}" ), // phpcs:ignore
-			'missing_suburb' => (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} p WHERE {$scope} AND " . $this->suburb_empty_sql() ), // phpcs:ignore
-			'to_process'     => (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} p WHERE {$scope} AND " . $this->needs_sql() . ' AND ' . $this->pending_sql() ), // phpcs:ignore
+			'total'         => (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} p WHERE {$scope}" ), // phpcs:ignore
+			'missing_smart' => (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} p WHERE {$scope} AND " . $this->meta_empty_sql( self::settings()['smart_key'] ) ), // phpcs:ignore
+			'to_process'    => (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} p WHERE {$scope} AND " . $this->needs_sql() . ' AND ' . $this->pending_sql() ), // phpcs:ignore
 		);
 		foreach ( (array) $wpdb->get_results( $wpdb->prepare( "SELECT meta_value AS status, COUNT(*) AS n FROM {$wpdb->postmeta} WHERE meta_key = %s GROUP BY meta_value", self::META_STATUS ) ) as $row ) {
 			$out[ 'status_' . $row->status ] = (int) $row->n;
+		}
+		return $out;
+	}
+
+	/**
+	 * Manual vs smart suburb for properties in scope.
+	 *
+	 * @return array list of array( id, title, postcode, manual, smart, smart_state (saved|suggested|''), comparison, src, confidence, status )
+	 */
+	public function comparison_rows() {
+		global $wpdb;
+		$s   = self::settings();
+		$ids = array_map( 'intval', $wpdb->get_col( "SELECT p.ID FROM {$wpdb->posts} p WHERE " . $this->scope_sql() . ' ORDER BY p.ID DESC' ) ); // phpcs:ignore
+		$out = array();
+		foreach ( array_chunk( $ids, 500 ) as $chunk ) {
+			update_meta_cache( 'post', $chunk );
+			foreach ( $chunk as $pid ) {
+				$status = (string) get_post_meta( $pid, self::META_STATUS, true );
+				$st     = self::get_state( $pid );
+				$manual = self::meta_values( $pid, $s['manual_key'] );
+				$smart  = implode( ', ', self::meta_values( $pid, $s['smart_key'] ) );
+				$state  = '' !== $smart ? 'saved' : '';
+				if ( '' === $smart && 'suggested' === $status && ! empty( $st['v']['n'] ) ) {
+					$smart = (string) $st['v']['n'];
+					$state = 'suggested';
+				}
+				$checked = '' !== $smart || ( '' !== $status && 'retry' !== $status );
+				$conf    = array( 'h' => 'high', 'm' => 'medium', 'l' => 'low' );
+				$out[]   = array(
+					'id'          => $pid,
+					'title'       => get_the_title( $pid ),
+					'postcode'    => (string) get_post_meta( $pid, '_address_postcode', true ),
+					'manual'      => implode( ', ', $manual ),
+					'smart'       => $smart,
+					'smart_state' => $state,
+					'comparison'  => self::compare( $manual, $smart, $checked ),
+					'src'         => (string) ( $st['src'] ?? '' ),
+					'confidence'  => $conf[ $st['cf'] ?? '' ] ?? '',
+					'status'      => $status,
+				);
+			}
 		}
 		return $out;
 	}
@@ -657,27 +577,7 @@ final class PH_Smart_Location {
 
 		$post_id = (int) $post_id;
 		$s       = self::settings();
-		if ( ! $s['on_import'] || 'property' !== get_post_type( $post_id ) ) {
-			return;
-		}
-
-		if ( self::uses_taxonomy() && $this->suburb_is_empty( $post_id ) ) {
-			// The import's own address matching replaces a property's Locations on every run and can
-			// remove the ones Smart Location added. Put them back – no lookups needed.
-			$state = self::get_state( $post_id );
-			if ( ! empty( $state['l'] ) ) {
-				$this->load_terms();
-				$ids = array_values( array_filter( array_map( 'intval', (array) $state['l'] ), function ( $id ) {
-					return isset( $this->terms[ $id ] );
-				} ) );
-				if ( $ids ) {
-					wp_set_object_terms( $post_id, $ids, self::TAXONOMY, true );
-					$this->log( 'info', 'Re-applied Locations removed by the import: ' . implode( ', ', array_map( array( $this, 'term_path' ), $ids ) ), $post_id );
-				}
-			}
-		}
-
-		if ( $halted || isset( $seen[ $post_id ] ) ) {
+		if ( ! $s['on_import'] || $halted || isset( $seen[ $post_id ] ) || 'property' !== get_post_type( $post_id ) ) {
 			return;
 		}
 		$seen[ $post_id ] = true;
@@ -720,11 +620,8 @@ final class PH_Smart_Location {
 	 * =================================================================== */
 
 	/**
-	 * Work out (and, in assign mode, save) the suburb – and any enabled neighbourhood / quarter
-	 * custom fields – for one property.
-	 *
-	 * Location mode: an existing Location with the suburb's name is reused wherever it sits in the
-	 * hierarchy; otherwise a new top-level Location is created for the site to arrange.
+	 * Work out (and, in assign mode, save) the smart suburb – and any enabled neighbourhood /
+	 * quarter fields – for one property. Only empty fields are filled.
 	 *
 	 * @param bool $dry_run Save and record nothing (test tool).
 	 * @return array Result (verbose; only ever logged, never stored on the property).
@@ -738,9 +635,8 @@ final class PH_Smart_Location {
 			'status'      => '',
 			'suburb'      => '',
 			'src'         => '',
-			'term_id'     => 0,
-			'extras'      => array(), // OSM field => value for neighbourhood / quarter custom fields
-			'l'           => array_map( 'intval', (array) ( $prev['l'] ?? array() ) ),
+			'cf'          => '',
+			'extras'      => array(),
 			'o'           => null,
 			'a'           => null,
 			'n'           => (int) ( $prev['n'] ?? 0 ),
@@ -748,7 +644,7 @@ final class PH_Smart_Location {
 			'context'     => array(),
 		);
 
-		$need_suburb  = $this->suburb_is_empty( $pid );
+		$need_suburb  = $this->smart_is_empty( $pid );
 		$extra_fields = $this->empty_extra_fields( $pid );
 		if ( ! $need_suburb && ! $extra_fields ) {
 			$r['status']  = 'skipped';
@@ -815,6 +711,7 @@ final class PH_Smart_Location {
 						$ranks     = array( 'low' => 1, 'medium' => 2, 'high' => 3 );
 						$confident = ( $ranks[ $c['confidence'] ] ?? 0 ) >= $ranks[ $s['claude_min_confidence'] ];
 						$r['a']    = $confident ? 'used' : 'unsure';
+						$r['cf']   = substr( $c['confidence'], 0, 1 );
 						if ( '' !== $c['suburb'] ) {
 							if ( $confident ) {
 								$r['suburb'] = $c['suburb'];
@@ -827,30 +724,12 @@ final class PH_Smart_Location {
 				}
 			}
 
-			/* 3. Existing Location / existing spelling */
+			/* 3. Use the spelling already used on the site, if any */
 			if ( '' !== $r['suburb'] ) {
-				if ( self::uses_taxonomy() ) {
-					$r['term_id'] = $this->find_term( $r['suburb'], $address );
-					if ( $r['term_id'] ) {
-						$r['suburb'] = $this->terms[ $r['term_id'] ]->name;
-						if ( ! $dry_run ) {
-							$this->add_suburb_terms( array( $r['term_id'] ) ); // it's a suburb, whatever happens next
-						}
-					} elseif ( ! $s['create_terms'] ) {
-						$r['notes'][] = sprintf( 'suburb "%s" is not a Location and creating Locations is switched off', $r['suburb'] );
-						$r['suburb']  = '';
-						$r['src']     = '';
-					} else {
-						$r['notes'][] = 'new top-level Location';
-					}
-				} else {
-					$vocab = $this->meta_vocab();
-					$n     = self::normalise( $r['suburb'] );
-					if ( isset( $vocab[ $n ] ) ) {
-						$r['suburb'] = $vocab[ $n ];
-					} else {
-						$r['notes'][] = 'new suburb';
-					}
+				$vocab = $this->vocab();
+				$n     = self::normalise( $r['suburb'] );
+				if ( isset( $vocab[ $n ] ) ) {
+					$r['suburb'] = $vocab[ $n ];
 				}
 			}
 		}
@@ -863,47 +742,17 @@ final class PH_Smart_Location {
 
 		$r['status'] = 'assign' === $s['mode'] ? 'assigned' : 'suggested';
 		if ( ! $dry_run && 'assigned' === $r['status'] ) {
-			$saved = $this->save_values( $pid, $r );
-			if ( is_wp_error( $saved ) ) {
-				$r['status']  = 'error';
-				$r['notes'][] = $saved->get_error_message();
-			}
+			$this->save_values( $pid, $r );
 		}
 		return $this->finish( $r, $dry_run );
 	}
 
-	/**
-	 * Save values. The suburb Location is added alongside any already on the property (never
-	 * removed), creating it at the top level if new. Custom fields are only written when empty.
-	 *
-	 * @return true|WP_Error
-	 */
-	private function save_values( $pid, &$r ) {
+	/** Save values – only into empty fields, so manual edits are never overwritten. */
+	private function save_values( $pid, $r ) {
 		$s = self::settings();
-		if ( '' !== $r['suburb'] && $this->suburb_is_empty( $pid ) ) {
-			if ( self::uses_taxonomy() ) {
-				$tid = (int) $r['term_id'];
-				if ( ! $tid ) {
-					$tid = $this->find_term( $r['suburb'] ); // may have been created since the suggestion was made
-				}
-				if ( ! $tid ) {
-					$tid = $this->create_term( $r['suburb'] );
-					if ( is_wp_error( $tid ) ) {
-						return new WP_Error( 'term', 'Could not create Location "' . $r['suburb'] . '": ' . $tid->get_error_message() );
-					}
-					$this->log( 'info', sprintf( 'Created top-level Location "%s"', $r['suburb'] ), $pid );
-				}
-				$this->add_suburb_terms( array( $tid ) );
-				$set = wp_set_object_terms( $pid, array( $tid ), self::TAXONOMY, true );
-				if ( is_wp_error( $set ) ) {
-					return $set;
-				}
-				$r['term_id'] = $tid;
-				$r['l']       = array_values( array_unique( array_merge( (array) ( $r['l'] ?? array() ), array( $tid ) ) ) );
-			} else {
-				update_post_meta( $pid, $s['suburb_key'], $r['suburb'] );
-				$this->vocab = null;
-			}
+		if ( '' !== $r['suburb'] && $this->smart_is_empty( $pid ) ) {
+			update_post_meta( $pid, $s['smart_key'], $r['suburb'] );
+			$this->vocab = null;
 		}
 		foreach ( self::extra_fields() as $f => $key ) {
 			if ( ! empty( $r['extras'][ $f ] ) && ! self::meta_values( $pid, $key ) ) {
@@ -911,7 +760,6 @@ final class PH_Smart_Location {
 			}
 		}
 		do_action( 'phsl_values_assigned', $pid, $r );
-		return true;
 	}
 
 	/** Store the tiny state, write the verbose details to the log file. */
@@ -927,14 +775,18 @@ final class PH_Smart_Location {
 
 		$parts = array();
 		if ( '' !== $r['suburb'] ) {
-			$label = $r['term_id'] ? $this->term_path( $r['term_id'] ) : $r['suburb'] . ( self::uses_taxonomy() ? ' (new)' : '' );
-			$parts[] = sprintf( 'suburb "%s" from %s', $label, 'claude' === $r['src'] ? 'Claude' : 'OSM' );
+			$parts[] = sprintf( 'smart suburb "%s" from %s', $r['suburb'], 'claude' === $r['src'] ? 'Claude' : 'OSM' );
 		}
 		foreach ( $r['extras'] as $f => $v ) {
 			$parts[] = sprintf( '%s "%s"', $f, $v );
 		}
-		$labels       = array( 'not_found' => 'Nothing found' );
-		$r['message'] = ( $labels[ $r['status'] ] ?? ucfirst( $r['status'] ) ) . ( $parts ? ': ' . implode( '; ', $parts ) : '' ) . ( $r['notes'] ? ' – ' . implode( '; ', $r['notes'] ) : '' );
+		$manual = self::meta_values( $pid, self::settings()['manual_key'] );
+		if ( '' !== $r['suburb'] ) {
+			$parts[] = sprintf( 'manual suburb "%s" → %s', implode( ', ', $manual ), self::compare( $manual, $r['suburb'], true ) );
+		}
+		$r['comparison'] = self::compare( $manual, $r['suburb'], true );
+		$labels          = array( 'not_found' => 'Nothing found' );
+		$r['message']    = ( $labels[ $r['status'] ] ?? ucfirst( $r['status'] ) ) . ( $parts ? ': ' . implode( '; ', $parts ) : '' ) . ( $r['notes'] ? ' – ' . implode( '; ', $r['notes'] ) : '' );
 		if ( 'retry' === $r['status'] && empty( $r['halt'] ) ) {
 			$r['message'] .= sprintf( ' (will retry, attempt %d of 3)', $r['n'] );
 		}
@@ -953,14 +805,13 @@ final class PH_Smart_Location {
 			'o'   => $r['o'],
 			'a'   => $r['a'],
 			'src' => $r['src'],
+			'cf'  => $r['cf'],
 			'n'   => 'retry' === $r['status'] ? $r['n'] : null,
-			'l'   => $r['l'] ? $r['l'] : null,
 		);
 		if ( 'suggested' === $r['status'] ) {
 			$state['v'] = array_filter(
 				array(
 					'n'  => $r['suburb'],
-					't'  => $r['term_id'],
 					'nb' => $r['extras']['neighbourhood'] ?? '',
 					'q'  => $r['extras']['quarter'] ?? '',
 				)
@@ -1303,14 +1154,16 @@ final class PH_Smart_Location {
 		if ( 'property' !== get_post_type( $pid ) ) {
 			wp_send_json_error( array( 'message' => 'Not a property ID.' ) );
 		}
+		$s = self::settings();
 		$r = $this->process_property( $pid, true );
 		wp_send_json_success(
 			array(
-				'property'       => get_the_title( $pid ),
-				'current_suburb' => $this->current_suburb_label( $pid ),
-				'note'           => 'Test only: nothing was saved, created or recorded. A property that already has a known suburb Location and filled custom fields is skipped.',
-				'result'         => $r,
-				'osm_request'    => $this->last_osm,
+				'property'      => get_the_title( $pid ),
+				'manual_suburb' => implode( ', ', self::meta_values( $pid, $s['manual_key'] ) ),
+				'smart_suburb'  => implode( ', ', self::meta_values( $pid, $s['smart_key'] ) ),
+				'note'          => 'Test only: nothing was saved or recorded. A property whose smart suburb (and any enabled extra fields) are already filled is skipped.',
+				'result'        => $r,
+				'osm_request'   => $this->last_osm,
 			)
 		);
 	}
@@ -1319,7 +1172,7 @@ final class PH_Smart_Location {
 	 * admin-post actions
 	 * =================================================================== */
 
-	/** Save a suggestion. */
+	/** Save a suggestion (only into empty fields). */
 	private function apply_one( $pid ) {
 		if ( 'suggested' !== get_post_meta( $pid, self::META_STATUS, true ) ) {
 			return false;
@@ -1327,21 +1180,14 @@ final class PH_Smart_Location {
 		$state = self::get_state( $pid );
 		$v     = (array) ( $state['v'] ?? array() );
 		$r     = array(
-			'suburb'  => (string) ( $v['n'] ?? '' ),
-			'term_id' => (int) ( $v['t'] ?? 0 ),
-			'extras'  => array_filter( array( 'neighbourhood' => $v['nb'] ?? '', 'quarter' => $v['q'] ?? '' ) ),
-			'src'     => (string) ( $state['src'] ?? '' ),
-			'l'       => (array) ( $state['l'] ?? array() ),
+			'suburb' => (string) ( $v['n'] ?? '' ),
+			'extras' => array_filter( array( 'neighbourhood' => $v['nb'] ?? '', 'quarter' => $v['q'] ?? '' ) ),
+			'src'    => (string) ( $state['src'] ?? '' ),
 		);
-		$saved = $this->save_values( $pid, $r );
-		if ( is_wp_error( $saved ) ) {
-			$this->log( 'error', 'Apply failed: ' . $saved->get_error_message(), $pid );
-			return false;
-		}
+		$this->save_values( $pid, $r );
 		unset( $state['v'] );
-		$state['l'] = $r['l'] ? $r['l'] : null;
 		$this->set_state( $pid, 'assigned', $state );
-		$this->log( 'info', sprintf( 'Assigned (applied by %s): %s', wp_get_current_user()->user_login, $r['term_id'] ? $this->term_path( $r['term_id'] ) : $r['suburb'] ), $pid );
+		$this->log( 'info', sprintf( 'Assigned (applied by %s): smart suburb "%s"', wp_get_current_user()->user_login, $r['suburb'] ), $pid );
 		return true;
 	}
 
@@ -1391,6 +1237,60 @@ final class PH_Smart_Location {
 			$this->log( 'info', sprintf( 'Re-queued %d properties (%s) by %s', $n, $which, wp_get_current_user()->user_login ) );
 		}
 		$this->redirect( 'run', 'requeued' );
+	}
+
+	/** CSV: manual suburb, smart suburb and the comparison side by side. */
+	public function handle_export() {
+		$this->check_admin_request( 'phsl_export' );
+		$only = sanitize_text_field( wp_unslash( $_POST['comparison'] ?? '' ) );
+		$rows = $this->comparison_rows();
+
+		nocache_headers();
+		header( 'Content-Type: text/csv; charset=utf-8' );
+		header( 'Content-Disposition: attachment; filename=smart-suburb-comparison-' . gmdate( 'Y-m-d' ) . '.csv' );
+
+		$out = fopen( 'php://output', 'w' );
+		fwrite( $out, "\xEF\xBB\xBF" ); // UTF-8 BOM so Excel shows names like "King’s Norton" correctly
+		$header = array( 'Property ID', 'Property', 'Postcode', 'Manual suburb', 'Smart suburb', 'Comparison', 'Smart suburb status', 'Smart suburb source', 'Claude confidence', 'Lookup status' );
+		$extras = self::extra_fields();
+		foreach ( $extras as $f => $key ) {
+			$header[] = ucfirst( $f );
+		}
+		fputcsv( $out, $header );
+
+		$sources = array( 'osm:suburb' => 'OpenStreetMap', 'claude' => 'Claude' );
+		$status  = array( 'not_found' => 'nothing found' );
+		foreach ( $rows as $row ) {
+			if ( '' !== $only && $row['comparison'] !== $only ) {
+				continue;
+			}
+			$line = array(
+				$row['id'],
+				$row['title'],
+				$row['postcode'],
+				$row['manual'],
+				$row['smart'],
+				$row['comparison'],
+				$row['smart_state'],
+				$sources[ $row['src'] ] ?? $row['src'],
+				$row['confidence'],
+				$status[ $row['status'] ] ?? $row['status'],
+			);
+			foreach ( $extras as $key ) {
+				$line[] = implode( ', ', self::meta_values( $row['id'], $key ) );
+			}
+			// Guard against spreadsheet formula injection.
+			$line = array_map(
+				function ( $v ) {
+					$v = (string) $v;
+					return ( '' !== $v && in_array( $v[0], array( '=', '+', '-', '@' ), true ) && ! is_numeric( $v ) ) ? "'" . $v : $v;
+				},
+				$line
+			);
+			fputcsv( $out, $line );
+		}
+		fclose( $out );
+		exit;
 	}
 
 	public function handle_clear_log() {
@@ -1497,7 +1397,6 @@ final class PH_Smart_Location {
 	private function render_run() {
 		$s      = self::settings();
 		$c      = $this->counts();
-		$tax    = self::uses_taxonomy();
 		$extras = self::extra_fields();
 		$when   = array();
 		if ( $s['on_import'] ) {
@@ -1506,26 +1405,33 @@ final class PH_Smart_Location {
 		if ( $s['auto_new'] ) {
 			$when[] = 'every 10 minutes';
 		}
+		$rows   = $this->comparison_rows();
+		$counts = array_fill_keys( array_keys( self::$comparisons ), 0 );
+		foreach ( $rows as $row ) {
+			$counts[ $row['comparison'] ]++;
+		}
+		$both = $counts['match'] + $counts['near match'] + $counts['partial match'] + $counts['mismatch'];
 		?>
 		<div class="phsl-card">
 			<h2>Status</h2>
 			<p><strong>Mode:</strong>
 				<?php if ( 'assign' === $s['mode'] ) : ?>
-					<span class="phsl-badge phsl-assigned">Assign automatically</span>: values are saved<?php echo $tax && $s['create_terms'] ? ' and new suburbs are created as top-level Locations' : ''; ?>.
+					<span class="phsl-badge phsl-assigned">Assign automatically</span>: the smart suburb is saved to <code><?php echo esc_html( $s['smart_key'] ); ?></code>.
 				<?php else : ?>
-					<span class="phsl-badge phsl-suggested">Suggest only</span>: nothing is saved or created; review suggestions on the Results tab.
+					<span class="phsl-badge phsl-suggested">Suggest only</span>: nothing is saved; review suggestions on the Results tab.
 				<?php endif; ?>
 			</p>
-			<p><strong>Suburb → <?php echo esc_html( $tax ? 'Location' : 'custom field ' . $s['suburb_key'] ); ?>:</strong> OpenStreetMap suburb
+			<p><strong>Smart suburb:</strong> OpenStreetMap suburb
 				<?php if ( self::claude_enabled() ) : ?>, then <strong><?php echo esc_html( self::$models[ $s['claude_model'] ] ); ?></strong>.
 				<?php elseif ( $s['use_claude'] ) : ?>. <span class="phsl-warn">Claude is enabled but there is no API key.</span>
 				<?php else : ?>. Claude is off.<?php endif; ?>
+				Only filled when empty, so a smart suburb edited by hand is kept.
 			</p>
-			<p><strong>Custom fields:</strong> <?php echo $extras ? esc_html( implode( ', ', array_map( function ( $f, $k ) { return $f . ' → ' . $k; }, array_keys( $extras ), $extras ) ) ) . ' (from OpenStreetMap, only when empty)' : 'none'; ?></p>
+			<p><strong>Other fields:</strong> <?php echo $extras ? esc_html( implode( ', ', array_map( function ( $f, $k ) { return $f . ' → ' . $k; }, array_keys( $extras ), $extras ) ) ) . ' (from OpenStreetMap, only when empty)' : 'none'; ?></p>
 			<p><strong>New properties:</strong> <?php echo esc_html( $when ? 'processed ' . implode( ' and ', $when ) : 'not processed automatically' ); ?>.</p>
 			<table class="widefat phsl-counts"><tbody>
 				<tr><td>Properties in scope</td><td class="num"><?php echo esc_html( number_format_i18n( $c['total'] ) ); ?></td></tr>
-				<tr><td>Without a <?php echo $tax ? 'known suburb Location' : 'suburb'; ?></td><td class="num"><?php echo esc_html( number_format_i18n( $c['missing_suburb'] ) ); ?></td></tr>
+				<tr><td>Without a smart suburb</td><td class="num"><?php echo esc_html( number_format_i18n( $c['missing_smart'] ) ); ?></td></tr>
 				<tr><td>Waiting to be processed</td><td class="num" id="phsl-to-process"><?php echo esc_html( number_format_i18n( $c['to_process'] ) ); ?></td></tr>
 				<?php foreach ( array( 'suggested' => 'Suggestions awaiting review', 'assigned' => 'Assigned', 'not_found' => 'Nothing found', 'retry' => 'Waiting to retry', 'error' => 'Errors' ) as $k => $label ) : ?>
 					<tr><td><a href="<?php echo esc_url( self::page_url( 'results', array( 'status' => $k ) ) ); ?>"><?php echo esc_html( $label ); ?></a></td><td class="num"><?php echo esc_html( number_format_i18n( $c[ 'status_' . $k ] ?? 0 ) ); ?></td></tr>
@@ -1533,27 +1439,32 @@ final class PH_Smart_Location {
 			</tbody></table>
 		</div>
 
-		<?php
-		if ( $tax ) :
-			$this->load_terms();
-			$names = array();
-			foreach ( self::suburb_term_ids() as $id ) {
-				if ( isset( $this->terms[ $id ] ) ) {
-					$names[] = $this->terms[ $id ]->name;
-				}
-			}
-			natcasesort( $names );
-			?>
-			<div class="phsl-card">
-				<h2>Known suburbs (<?php echo count( $names ); ?>)</h2>
-				<p class="description">Locations Smart Location has identified as suburbs (matched or created), stored in the <code><?php echo esc_html( self::SUBURBS_OPTION ); ?></code> option. A property that already has one of these, for example matched from its address during import, needs no lookup. New suburbs are created as top-level Locations; arrange them in your Location hierarchy however you like – they are still recognised wherever they sit. The list grows as properties are looked up.</p>
-				<p><?php echo $names ? esc_html( implode( ', ', $names ) ) : '–'; ?></p>
-			</div>
-		<?php endif; ?>
+		<div class="phsl-card">
+			<h2>Manual vs smart suburb</h2>
+			<p class="description">Compares the manually entered suburb (<code><?php echo esc_html( $s['manual_key'] ); ?></code>) with the smart suburb (<code><?php echo esc_html( $s['smart_key'] ); ?></code>, or the pending suggestion in Suggest mode).</p>
+			<table class="widefat striped phsl-compare">
+				<thead><tr><th>Comparison</th><th class="num">Properties</th><th class="num">% of both filled</th><th></th></tr></thead>
+				<tbody>
+				<?php foreach ( self::$comparisons as $key => $desc ) : ?>
+					<tr>
+						<td><span class="phsl-badge phsl-cmp-<?php echo esc_attr( str_replace( ' ', '-', $key ) ); ?>"><?php echo esc_html( $key ); ?></span><br><small><?php echo esc_html( $desc ); ?></small></td>
+						<td class="num"><?php echo esc_html( number_format_i18n( $counts[ $key ] ) ); ?></td>
+						<td class="num"><?php echo in_array( $key, array( 'match', 'near match', 'partial match', 'mismatch' ), true ) && $both ? esc_html( number_format_i18n( 100 * $counts[ $key ] / $both, 1 ) . '%' ) : ''; ?></td>
+						<td><?php echo $counts[ $key ] ? '<a href="' . esc_url( self::page_url( 'results', array( 'comparison' => $key ) ) ) . '">View</a>' : ''; ?></td>
+					</tr>
+				<?php endforeach; ?>
+				</tbody>
+			</table>
+			<p>
+				<?php $this->post_button( 'phsl_export', 'Export all (CSV)', array(), 'button button-primary' ); ?>
+				<?php $this->post_button( 'phsl_export', 'Export mismatches only', array( 'comparison' => 'mismatch' ) ); ?>
+			</p>
+			<p class="description">The CSV has the manual suburb, smart suburb and comparison side by side, plus where the smart suburb came from and Claude’s confidence.</p>
+		</div>
 
 		<div class="phsl-card">
 			<h2>Process existing properties</h2>
-			<p class="description">Works through properties without a suburb<?php echo $extras ? ' or with an empty ' . esc_html( implode( '/', array_keys( $extras ) ) ) . ' field' : ''; ?>, newest first, within OpenStreetMap’s limit of one request per second. Stop and resume at any time.</p>
+			<p class="description">Works through properties without a smart suburb<?php echo $extras ? ' or with an empty ' . esc_html( implode( '/', array_keys( $extras ) ) ) . ' field' : ''; ?>, newest first, within OpenStreetMap’s limit of one request per second. Stop and resume at any time.</p>
 			<div class="phsl-controls">
 				<label>Run for <input type="number" id="phsl-minutes" min="1" max="240" value="10" class="small-text"> minutes</label>
 				<label>or at most <input type="number" id="phsl-max" min="1" value="100" class="small-text"> properties</label>
@@ -1569,15 +1480,15 @@ final class PH_Smart_Location {
 				<?php
 				$this->post_button( 'phsl_requeue', 'Retry “nothing found” where Claude wasn’t tried', array( 'which' => 'not_found' ) );
 				$this->post_button( 'phsl_requeue', 'Retry errors', array( 'which' => 'errors' ) );
-				$this->post_button( 'phsl_requeue', 'Re-queue everything', array( 'which' => 'all' ), 'button button-link-delete', 'Forget all previous attempts and suggestions? Properties will be looked up again (Claude calls cost a little).' );
+				$this->post_button( 'phsl_requeue', 'Re-queue everything', array( 'which' => 'all' ), 'button button-link-delete', 'Forget all previous attempts and suggestions? Properties without a smart suburb will be looked up again (Claude calls cost a little). Saved smart suburbs are kept.' );
 				?>
 			</p>
-			<p class="description">Properties where Claude answered with low confidence are not retried by the first button, as asking again gives the same answer. When an API key is added, properties that missed out on Claude for lack of a key are re-queued automatically.</p>
+			<p class="description">To redo a property’s smart suburb, clear its <code><?php echo esc_html( $s['smart_key'] ); ?></code> field and click Retry on the Results tab.</p>
 		</div>
 
 		<div class="phsl-card">
 			<h2>Test a property</h2>
-			<p class="description">Shows what would happen for one property without saving or creating anything. If Claude is needed this makes a real (very cheap) API call.</p>
+			<p class="description">Shows what would happen for one property without saving anything. If Claude is needed this makes a real (very cheap) API call.</p>
 			<div class="phsl-controls">
 				<label>Property ID <input type="number" id="phsl-test-id" class="small-text"></label>
 				<button type="button" class="button" id="phsl-test">Test</button>
@@ -1589,78 +1500,104 @@ final class PH_Smart_Location {
 
 	private function render_results() {
 		global $wpdb;
-		$labels   = array( 'suggested' => 'Suggested', 'assigned' => 'Assigned', 'not_found' => 'Nothing found', 'retry' => 'Waiting to retry', 'error' => 'Error', 'skipped' => 'Skipped' );
-		$status   = sanitize_key( $_GET['status'] ?? '' );
-		$paged    = max( 1, absint( $_GET['paged'] ?? 1 ) );
-		$per_page = 50;
-		$extras   = self::extra_fields();
+		$labels     = array( 'suggested' => 'Suggested', 'assigned' => 'Assigned', 'not_found' => 'Nothing found', 'retry' => 'Waiting to retry', 'error' => 'Error', 'skipped' => 'Skipped' );
+		$status     = sanitize_key( $_GET['status'] ?? '' );
+		$comparison = sanitize_text_field( wp_unslash( $_GET['comparison'] ?? '' ) );
+		$comparison = isset( self::$comparisons[ $comparison ] ) ? $comparison : '';
+		$paged      = max( 1, absint( $_GET['paged'] ?? 1 ) );
+		$per_page   = 50;
+		$s          = self::settings();
+		$extras     = self::extra_fields();
 
-		$where = $wpdb->prepare( 'st.meta_key = %s', self::META_STATUS );
-		if ( isset( $labels[ $status ] ) ) {
-			$where .= $wpdb->prepare( ' AND st.meta_value = %s', $status );
+		if ( $comparison ) {
+			// Comparison filter works across every property in scope, processed or not.
+			$all   = array_values( array_filter( $this->comparison_rows(), function ( $r ) use ( $comparison ) {
+				return $r['comparison'] === $comparison;
+			} ) );
+			$total = count( $all );
+			$rows  = array();
+			foreach ( array_slice( $all, ( $paged - 1 ) * $per_page, $per_page ) as $r ) {
+				$rows[] = (object) array( 'ID' => $r['id'], 'post_title' => $r['title'], 'status' => $r['status'] );
+			}
+		} else {
+			$where = $wpdb->prepare( 'st.meta_key = %s', self::META_STATUS );
+			if ( isset( $labels[ $status ] ) ) {
+				$where .= $wpdb->prepare( ' AND st.meta_value = %s', $status );
+			}
+			$from  = "{$wpdb->postmeta} st INNER JOIN {$wpdb->posts} p ON p.ID = st.post_id";
+			$total = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$from} WHERE {$where}" ); // phpcs:ignore
+			$rows  = $wpdb->get_results( $wpdb->prepare( "SELECT p.ID, p.post_title, st.meta_value AS status FROM {$from} WHERE {$where} ORDER BY st.meta_id DESC LIMIT %d OFFSET %d", $per_page, ( $paged - 1 ) * $per_page ) ); // phpcs:ignore
 		}
-		$from  = "{$wpdb->postmeta} st INNER JOIN {$wpdb->posts} p ON p.ID = st.post_id";
-		$total = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$from} WHERE {$where}" ); // phpcs:ignore
-		$rows  = $wpdb->get_results( $wpdb->prepare( "SELECT p.ID, p.post_title, st.meta_value AS status FROM {$from} WHERE {$where} ORDER BY st.meta_id DESC LIMIT %d OFFSET %d", $per_page, ( $paged - 1 ) * $per_page ) ); // phpcs:ignore
 
 		$osm_label    = array( '1' => 'found', '0' => 'no suburb', 'x' => 'failed' );
 		$claude_label = array( 'used' => 'used', 'unsure' => 'unsure', 'error' => 'failed', 'nokey' => 'no API key' );
+		$conf         = array( 'h' => 'high', 'm' => 'medium', 'l' => 'low' );
 		?>
 		<div class="phsl-toolbar">
 			<form method="get" class="phsl-inline">
 				<input type="hidden" name="page" value="<?php echo esc_attr( self::PAGE_SLUG ); ?>">
 				<input type="hidden" name="tab" value="results">
-				<select name="status" onchange="this.form.submit()">
-					<option value="">All</option>
+				<select name="status" onchange="this.form.comparison.value='';this.form.submit()">
+					<option value="">All statuses</option>
 					<?php foreach ( $labels as $k => $l ) : ?>
 						<option value="<?php echo esc_attr( $k ); ?>" <?php selected( $status, $k ); ?>><?php echo esc_html( $l ); ?></option>
 					<?php endforeach; ?>
 				</select>
+				<select name="comparison" onchange="this.form.status.value='';this.form.submit()">
+					<option value="">Any comparison</option>
+					<?php foreach ( array_keys( self::$comparisons ) as $k ) : ?>
+						<option value="<?php echo esc_attr( $k ); ?>" <?php selected( $comparison, $k ); ?>><?php echo esc_html( $k ); ?></option>
+					<?php endforeach; ?>
+				</select>
 			</form>
-			<?php $this->post_button( 'phsl_apply_all', 'Apply all suggestions', array(), 'button button-primary', 'Save all suggestions to their properties? New suburbs are created as top-level Locations.' ); ?>
+			<?php $this->post_button( 'phsl_apply_all', 'Apply all suggestions', array(), 'button button-primary', 'Save all suggested smart suburbs? Only empty fields are filled.' ); ?>
+			<?php $this->post_button( 'phsl_export', 'Export CSV', $comparison ? array( 'comparison' => $comparison ) : array() ); ?>
 			<span class="description"><?php echo esc_html( number_format_i18n( $total ) ); ?> properties. Full details of each decision are in the Log.</span>
 		</div>
 		<table class="widefat striped">
 			<thead><tr>
-				<th>Property</th>
-				<th>Suburb</th>
+				<th>Property</th><th>Manual suburb</th><th>Smart suburb</th><th>Comparison</th>
 				<?php foreach ( array_keys( $extras ) as $f ) : ?><th><?php echo esc_html( ucfirst( $f ) ); ?></th><?php endforeach; ?>
 				<th>OSM</th><th>Claude</th><th>Status</th><th></th>
 			</tr></thead>
 			<tbody>
 			<?php if ( ! $rows ) : ?>
-				<tr><td colspan="<?php echo 6 + count( $extras ); ?>">Nothing yet.</td></tr>
+				<tr><td colspan="<?php echo 8 + count( $extras ); ?>">Nothing here.</td></tr>
 			<?php endif; ?>
 			<?php
 			foreach ( $rows as $row ) :
-				$pid     = (int) $row->ID;
-				$st      = self::get_state( $pid );
-				$v       = (array) ( $st['v'] ?? array() );
-				$pending = 'suggested' === $row->status;
-				if ( $pending ) {
-					$sub    = ! empty( $v['t'] ) ? $this->term_path( $v['t'] ) : (string) ( $v['n'] ?? '' );
-					$is_new = self::uses_taxonomy() && ! empty( $v['n'] ) && empty( $v['t'] );
-				} else {
-					$sub    = $this->current_suburb_label( $pid );
-					$is_new = false;
+				$pid       = (int) $row->ID;
+				$st        = self::get_state( $pid );
+				$v         = (array) ( $st['v'] ?? array() );
+				$pending   = 'suggested' === $row->status;
+				$manual    = self::meta_values( $pid, $s['manual_key'] );
+				$smart     = implode( ', ', self::meta_values( $pid, $s['smart_key'] ) );
+				$suggested = '' === $smart && $pending && ! empty( $v['n'] );
+				if ( $suggested ) {
+					$smart = (string) $v['n'];
 				}
+				$cmp = self::compare( $manual, $smart, '' !== $smart || ( $row->status && 'retry' !== $row->status ) );
 				?>
 				<tr>
 					<td><a href="<?php echo esc_url( get_edit_post_link( $pid ) ?: '#' ); ?>"><?php echo esc_html( $row->post_title ? $row->post_title : '#' . $pid ); ?></a>
 						<?php if ( ! empty( $st['t'] ) ) : ?><br><small><?php echo esc_html( wp_date( 'j M Y H:i', $st['t'] ) ); ?></small><?php endif; ?></td>
-					<td><?php echo '' !== $sub ? esc_html( $sub ) : '–'; ?>
-						<?php if ( ! empty( $st['src'] ) ) : ?><br><small><?php echo esc_html( $st['src'] ); ?><?php echo $is_new ? ' · <strong>new suburb</strong>' : ''; ?></small><?php endif; ?></td>
+					<td><?php echo $manual ? esc_html( implode( ', ', $manual ) ) : '–'; ?></td>
+					<td><?php echo '' !== $smart ? esc_html( $smart ) : '–'; ?>
+						<?php if ( ! empty( $st['src'] ) ) : ?><br><small><?php echo esc_html( 'claude' === $st['src'] ? 'Claude' . ( ! empty( $st['cf'] ) ? ', ' . ( $conf[ $st['cf'] ] ?? '' ) . ' confidence' : '' ) : 'OpenStreetMap' ); ?><?php echo $suggested ? ' · <strong>suggested</strong>' : ''; ?></small><?php endif; ?></td>
+					<td><span class="phsl-badge phsl-cmp-<?php echo esc_attr( str_replace( ' ', '-', $cmp ) ); ?>"><?php echo esc_html( $cmp ); ?></span></td>
 					<?php foreach ( $extras as $f => $key ) : ?>
 						<td><?php echo esc_html( $pending ? ( $v[ 'neighbourhood' === $f ? 'nb' : 'q' ] ?? '–' ) : ( implode( ', ', self::meta_values( $pid, $key ) ) ?: '–' ) ); ?></td>
 					<?php endforeach; ?>
 					<td><?php echo esc_html( isset( $st['o'] ) ? ( $osm_label[ (string) $st['o'] ] ?? $st['o'] ) : '–' ); ?></td>
 					<td><?php echo esc_html( isset( $st['a'] ) ? ( $claude_label[ $st['a'] ] ?? $st['a'] ) : '–' ); ?></td>
-					<td><span class="phsl-badge phsl-<?php echo esc_attr( $row->status ); ?>"><?php echo esc_html( $labels[ $row->status ] ?? $row->status ); ?></span></td>
+					<td><?php echo $row->status ? '<span class="phsl-badge phsl-' . esc_attr( $row->status ) . '">' . esc_html( $labels[ $row->status ] ?? $row->status ) . '</span>' : '–'; ?></td>
 					<td class="phsl-actions">
-						<?php if ( 'suggested' === $row->status ) : ?>
-							<?php $this->post_button( 'phsl_apply', 'Apply', array( 'property_id' => $pid ), 'button button-small button-primary' ); ?>
-						<?php endif; ?>
-						<?php $this->post_button( 'phsl_retry', 'Retry', array( 'property_id' => $pid ), 'button button-small' ); ?>
+						<?php
+						if ( $pending ) {
+							$this->post_button( 'phsl_apply', 'Apply', array( 'property_id' => $pid ), 'button button-small button-primary' );
+						}
+						$this->post_button( 'phsl_retry', 'Retry', array( 'property_id' => $pid ), 'button button-small' );
+						?>
 						<a class="button button-small" href="<?php echo esc_url( self::page_url( 'log', array( 'property' => $pid ) ) ); ?>">Log</a>
 					</td>
 				</tr>
@@ -1751,9 +1688,9 @@ final class PH_Smart_Location {
 				<tr>
 					<th scope="row">Mode</th>
 					<td>
-						<label class="phsl-block"><input type="radio" name="mode" value="suggest" <?php checked( $s['mode'], 'suggest' ); ?>> <strong>Suggest only</strong>: list values on the Results tab for review; nothing is saved or created.</label>
-						<label class="phsl-block"><input type="radio" name="mode" value="assign" <?php checked( $s['mode'], 'assign' ); ?>> <strong>Assign automatically</strong>: save values to the property (creating new suburb Locations if needed).</label>
-						<p class="description">The suburb Location is only ever <strong>added</strong>; existing Locations are never removed. A property that already has a known suburb Location (e.g. matched from its address during import) is left alone. Custom fields are only filled when empty.</p>
+						<label class="phsl-block"><input type="radio" name="mode" value="suggest" <?php checked( $s['mode'], 'suggest' ); ?>> <strong>Suggest only</strong>: list values on the Results tab for review; nothing is saved.</label>
+						<label class="phsl-block"><input type="radio" name="mode" value="assign" <?php checked( $s['mode'], 'assign' ); ?>> <strong>Assign automatically</strong>: save values to the property.</label>
+						<p class="description">Either way, fields are only filled when they are <strong>empty</strong>, so a value edited by hand is never overwritten. The Location field is never touched.</p>
 					</td>
 				</tr>
 				<tr>
@@ -1777,19 +1714,14 @@ final class PH_Smart_Location {
 			<h2>Suburb</h2>
 			<table class="form-table" role="presentation">
 				<tr>
-					<th scope="row">Assign the suburb to</th>
-					<td>
-						<label class="phsl-block"><input type="radio" name="suburb_target" value="taxonomy" <?php checked( $s['suburb_target'], 'taxonomy' ); ?>> <strong>Location</strong> (Property Hive’s Location taxonomy)</label>
-						<label class="phsl-block"><input type="radio" name="suburb_target" value="meta" <?php checked( $s['suburb_target'], 'meta' ); ?>> Custom field <input type="text" name="suburb_key" class="regular-text code phsl-short" value="<?php echo esc_attr( $s['suburb_key'] ); ?>"></label>
-						<p class="description">The suburb comes from OpenStreetMap’s suburb, or from Claude when OpenStreetMap has none. Existing Locations are matched by name wherever they sit in the hierarchy, ignoring case and punctuation (“King’s Norton” = “Kings Norton”).</p>
-					</td>
+					<th scope="row"><label for="phsl-smart-key">Smart suburb field</label></th>
+					<td><input type="text" id="phsl-smart-key" name="smart_key" class="regular-text code phsl-short" value="<?php echo esc_attr( $s['smart_key'] ); ?>">
+						<p class="description">The property meta key the smart suburb is saved to (from OpenStreetMap’s suburb, or Claude when OpenStreetMap has none). Use this key in your search query.</p></td>
 				</tr>
 				<tr>
-					<th scope="row">New suburbs</th>
-					<td>
-						<label class="phsl-block"><input type="checkbox" name="create_terms" value="1" <?php checked( $s['create_terms'] ); ?>> Create the suburb Location if it doesn’t exist yet</label>
-						<p class="description">New suburbs are created as <strong>top-level</strong> Locations. Arrange them in your Location hierarchy however suits you (Settings → Custom Fields → Locations); Smart Location still recognises them wherever they are moved to.</p>
-					</td>
+					<th scope="row"><label for="phsl-manual-key">Manual suburb field</label></th>
+					<td><input type="text" id="phsl-manual-key" name="manual_key" class="regular-text code phsl-short" value="<?php echo esc_attr( $s['manual_key'] ); ?>">
+						<p class="description">The manually entered suburb, used only for the comparison and the CSV export – never changed. Where the same suburb already exists with a particular spelling (in either field), that spelling is used.</p></td>
 				</tr>
 			</table>
 
@@ -1802,14 +1734,15 @@ final class PH_Smart_Location {
 							<input type="text" name="<?php echo esc_attr( $f ); ?>_key" class="regular-text code phsl-short" value="<?php echo esc_attr( $s[ $f . '_key' ] ); ?>"></td>
 					</tr>
 				<?php endforeach; ?>
-				<tr><td colspan="2" class="phsl-flush"><p class="description">Only filled when empty, from OpenStreetMap only (Claude isn’t asked). When enabled, properties that already have a suburb but an empty field here are looked up on OpenStreetMap too.</p></td></tr>
+				<tr><td colspan="2" class="phsl-flush"><p class="description">Only filled when empty, from OpenStreetMap only (Claude isn’t asked). When enabled, properties that already have a smart suburb but an empty field here are looked up on OpenStreetMap too.</p></td></tr>
 			</table>
 
 			<h2>Claude</h2>
 			<table class="form-table" role="presentation">
 				<tr>
 					<th scope="row">Use Claude</th>
-					<td><label><input type="checkbox" name="use_claude" value="1" <?php checked( $s['use_claude'] ); ?>> Ask Claude for the suburb when OpenStreetMap has none</label></td>
+					<td><label><input type="checkbox" name="use_claude" value="1" <?php checked( $s['use_claude'] ); ?>> Ask Claude for the suburb when OpenStreetMap has none</label>
+						<p class="description">Also needed for Organise Locations.</p></td>
 				</tr>
 				<tr>
 					<th scope="row"><label for="phsl-key">API key</label></th>

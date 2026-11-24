@@ -1,63 +1,52 @@
-=== Property Hive Smart Location 1.3.1 ===
+=== Property Hive Smart Location 1.4 ===
 
-Assigns each property's suburb as a Property Hive Location, creating new suburbs as TOP-LEVEL
-Locations for the site to arrange in whatever hierarchy it wants. Optionally fills neighbourhood
-and quarter custom fields. Makes no assumptions about the Location hierarchy or its depth.
+Fills a "smart suburb" field (meta key smart_suburb by default) for each property, compares it with
+the manually entered suburb (_suburb by default), and can organise Location terms into a hierarchy.
+It never touches the Location taxonomy assignments or the manual suburb field.
 
-How it decides
-1. Skip: the property already has a Location known to be a suburb (see below), for example matched
-   from its address by the import add-on. No lookups.
-2. OpenStreetMap reverse lookup (coordinates; address search if none), max 1 request/second.
-   The suburb is OSM's "suburb"; if OSM has none, Claude is asked.
-3. An existing Location with that name is reused wherever it sits in the hierarchy (matched
-   ignoring case/punctuation; if several share the name, the one whose parent appears in the OSM
-   address wins). Otherwise a new top-level Location is created. Locations are only ever ADDED.
-4. Neighbourhood / quarter (optional, off by default): OSM's values are saved to their own custom
-   fields (default _neighbourhood / _quarter), only when empty. OSM only, no Claude.
-A custom field can be used for the suburb instead of Locations.
+How the smart suburb is found
+1. OpenStreetMap reverse lookup (coordinates; address search if none), max 1 request/second.
+   The smart suburb is OSM's "suburb".
+2. If OSM has none, Claude is asked (answers below the minimum confidence are not used).
+3. If the same suburb is already used on the site (in either field) with a particular spelling,
+   that spelling is used ("King's Norton" -> "Kings Norton").
+Fields are only ever filled when EMPTY, so a smart suburb edited by hand is never overwritten.
+To redo one, clear the field and click Retry. Optional neighbourhood / quarter custom fields are
+filled from OSM in the same way.
 
-Known suburbs
-The option `phsl_suburb_terms` lists the Location ids Smart Location has matched or created as
-suburbs. Moving them around the hierarchy doesn't matter. Deleted Locations are removed from it.
-Upgrading from an earlier build seeds it from the suburbs already assigned.
+Comparison (Overview tab, Results tab filter, CSV export)
+  match          same, ignoring case/punctuation, or one of several manual values
+  near match     small spelling slip (1 character; 2 for names of 10+ letters)
+  partial match  one contains the other as whole words ("Harborne" / "Harborne Village")
+  mismatch       both filled in and different
+  smart only     no manual suburb, smart suburb found
+  manual only    looked up, no smart suburb found
+  not checked    not looked up yet
+  both empty     neither has a value
+In Suggest mode the pending suggestion is compared (marked "suggested" in the export).
 
-Organise Locations (tab)
-A separate, manual process for after an import and now and again afterwards. Claude is given every
-Location (name, current parent, number of properties and those properties' most common postcode
-districts) and proposes a hierarchy of at most 3 levels that suits the list - e.g. Region › City ›
-Suburb, County › Town › Suburb, City › Town › Suburb, or some left at the top level.
-- "Place unplaced Locations": keeps the existing structure and fits top-level Locations with nothing
-  under them into it. "Full reorganise": proposes a structure for every Location.
-- Optional "Instructions for Claude" box: free-text guidance sent with the data (e.g. "use our
-  areas Birmingham North/South/East/West under Birmingham", "keep Solihull top level"). Followed
-  where possible within the rules (max 3 levels, no renaming, no loops - still enforced by the
-  plugin). Remembered for next time, shown with the proposal and logged. Max 3,000 characters.
-- May suggest new grouping Locations (each must hold 2+), unless switched off. A suggested grouping
-  named like an existing Location uses that Location.
-- Proposals that would loop or go deeper than 3 levels are left out and listed.
-- Review the proposed tree and the list of moves; untick any; "Apply selected". Locations are only
-  re-parented or created - never renamed or deleted. "Undo last apply" restores the previous
-  parents and removes created groupings that are still empty. Everything is logged.
-- Uses the configured Claude model at medium effort; long requests (up to 10 minutes) - if the
-  server times out, use "Place unplaced Locations" which sends less.
+CSV export columns: Property ID, Property, Postcode, Manual suburb, Smart suburb, Comparison,
+Smart suburb status (saved/suggested), Smart suburb source, Claude confidence, Lookup status,
+plus any enabled neighbourhood/quarter fields. "Export all" or one comparison value at a time.
 
 Modes: Suggest only (default; review on the Results tab, Apply / Apply all) or Assign automatically.
 
-Imports
-Runs after each property via propertyhive_property_imported (Property Import add-on, all formats)
-and propertyhive_property_imported_property_sales_online_json. The Property Import add-on's address
-matching REPLACES a property's Locations on every run, so suburbs Smart Location added are
-re-applied straight afterwards from the property's saved list - no lookups. New lookups: max
-20 / 60 seconds per import run, the rest via the 10-minute cron (new properties only).
+When it runs
+- After each imported property (propertyhive_property_imported, and the Property Sales Online
+  add-on's own hook); max 20 lookups / 60 seconds per import run.
+- Every 10 minutes for new properties (added since activation).
+- Existing properties: Overview tab > Process existing properties.
 
-Post meta (kept minimal)
-_phsl_status  assigned | suggested | not_found | retry | error | skipped
-_phsl         flags: t (time), o (OSM result), a (Claude: used/unsure/error/nokey), src,
-              l (Location ids assigned, for re-applying), n (retry count), v (pending suggestion)
+Organise Locations (tab)
+Separate, manual tool: Claude proposes a hierarchy (max 3 levels) for the Location terms using their
+names, parents, property counts and postcode districts, optionally following your own instructions.
+Review the proposed tree and moves, apply selected, undo the last apply. Never renames or deletes.
 
-Log
-Monthly files in wp-content/uploads/ph-smart-location-logs/ (protected; random file-name suffix),
-last 6 months kept. Viewable/filterable/downloadable on the Log tab, including per property.
+Post meta: _phsl_status (one word) and _phsl (small flags array). Detail goes to monthly log files
+in wp-content/uploads/ph-smart-location-logs/ (protected), viewable on the Log tab.
+
+Upgrading from 1.3.x: the Location tracking used by earlier builds is removed and properties are
+re-queued so the smart suburb field gets filled. Locations assigned or created earlier are left as
+they are.
 
 Claude API key: define( 'PHSL_ANTHROPIC_API_KEY', 'sk-ant-...' ); in wp-config.php (or Settings).
-Adding a key automatically re-queues properties that were skipped for lack of one.
