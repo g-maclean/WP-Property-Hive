@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Property Hive Smart Location
  * Description: Fills a "smart suburb" field for each property using OpenStreetMap, with Claude AI as a fallback, compares it with the manually entered suburb, and can organise Location terms into a sensible hierarchy.
- * Version: 1.4
+ * Version: 1.4.1
  * Author: Property Hive
  * Requires at least: 5.6
  * Requires PHP: 7.2
@@ -18,8 +18,8 @@ require_once __DIR__ . '/includes/class-phsl-organiser.php';
 
 final class PH_Smart_Location {
 
-	const VERSION       = '1.4';
-	const DB_VERSION    = '5';
+	const VERSION       = '1.4.1';
+	const DB_VERSION    = '6';
 	const OPTION        = 'phsl_settings';
 	const PAGE_SLUG     = 'ph-smart-location';
 	const NONCE         = 'phsl_nonce';
@@ -29,7 +29,7 @@ final class PH_Smart_Location {
 	const API_VERSION   = '2026-10-21';
 
 	/**
-	 * The plugin writes the suburb to its own field (default "smart_suburb"); it never touches the
+	 * The plugin writes the suburb to its own field (default "_smart_suburb"); it never touches the
 	 * Location taxonomy or the manually entered suburb. Fields are only filled when empty, so a
 	 * value someone edits by hand is never overwritten.
 	 *
@@ -144,6 +144,18 @@ final class PH_Smart_Location {
 			} );
 			$this->log( 'info', sprintf( 'Upgraded: the suburb is now saved to the smart suburb field, not Locations. %d properties re-queued.', $n ) );
 		}
+		if ( $version && version_compare( $version, '6', '<' ) ) {
+			// 1.4 saved to "smart_suburb" by default; the default is now "_smart_suburb".
+			$saved = (array) get_option( self::OPTION, array() );
+			if ( ! isset( $saved['smart_key'] ) || 'smart_suburb' === $saved['smart_key'] ) {
+				$moved = (int) $wpdb->query( $wpdb->prepare( "UPDATE {$wpdb->postmeta} SET meta_key = %s WHERE meta_key = %s", '_smart_suburb', 'smart_suburb' ) );
+				if ( isset( $saved['smart_key'] ) ) {
+					$saved['smart_key'] = '_smart_suburb';
+					update_option( self::OPTION, $saved, false );
+				}
+				$this->log( 'info', sprintf( 'Upgraded: smart suburb field renamed from smart_suburb to _smart_suburb (%d values moved).', $moved ) );
+			}
+		}
 		if ( self::DB_VERSION !== $version ) {
 			update_option( 'phsl_db_version', self::DB_VERSION, false );
 		}
@@ -167,7 +179,7 @@ final class PH_Smart_Location {
 			'on_import'             => 1,
 			'auto_new'              => 1,
 			'statuses'              => array( 'publish' ),
-			'smart_key'             => 'smart_suburb',
+			'smart_key'             => '_smart_suburb',
 			'manual_key'            => '_suburb',
 			'neighbourhood_enabled' => 0,
 			'neighbourhood_key'     => '_neighbourhood',
@@ -244,7 +256,7 @@ final class PH_Smart_Location {
 			'on_import'             => empty( $p['on_import'] ) ? 0 : 1,
 			'auto_new'              => empty( $p['auto_new'] ) ? 0 : 1,
 			'statuses'              => $statuses ? $statuses : array( 'publish' ),
-			'smart_key'             => self::sanitize_meta_key( $p['smart_key'] ?? 'smart_suburb', 'smart_suburb' ),
+			'smart_key'             => self::sanitize_meta_key( $p['smart_key'] ?? '_smart_suburb', '_smart_suburb' ),
 			'manual_key'            => self::sanitize_meta_key( $p['manual_key'] ?? '_suburb', '_suburb' ),
 			'neighbourhood_enabled' => empty( $p['neighbourhood_enabled'] ) ? 0 : 1,
 			'neighbourhood_key'     => self::sanitize_meta_key( $p['neighbourhood_key'] ?? '_neighbourhood', '_neighbourhood' ),

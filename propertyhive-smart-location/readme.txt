@@ -1,6 +1,6 @@
-=== Property Hive Smart Location 1.4 ===
+=== Property Hive Smart Location 1.4.1 ===
 
-Fills a "smart suburb" field (meta key smart_suburb by default) for each property, compares it with
+Fills a "smart suburb" field (meta key _smart_suburb by default) for each property, compares it with
 the manually entered suburb (_suburb by default), and can organise Location terms into a hierarchy.
 It never touches the Location taxonomy assignments or the manual suburb field.
 
@@ -44,6 +44,9 @@ Review the proposed tree and moves, apply selected, undo the last apply. Never r
 
 Post meta: _phsl_status (one word) and _phsl (small flags array). Detail goes to monthly log files
 in wp-content/uploads/ph-smart-location-logs/ (protected), viewable on the Log tab.
+
+Upgrading from 1.4: values saved under the old default key smart_suburb are renamed to
+_smart_suburb (unless a different key had been set in Settings).
 
 Upgrading from 1.3.x: the Location tracking used by earlier builds is removed and properties are
 re-queued so the smart suburb field gets filled. Locations assigned or created earlier are left as
