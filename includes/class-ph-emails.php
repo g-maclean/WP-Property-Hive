@@ -23,6 +23,9 @@ class PH_Emails {
 	/** @var PH_Emails The single instance of the class */
 	protected static $_instance = null;
 
+	/** @var string Error reported through wp_mail_failed during the current queue send. */
+	private $last_mail_error = '';
+
 	/**
 	 * Main PH_Emails Instance.
 	 *
@@ -192,6 +195,130 @@ class PH_Emails {
 	}
 
 	/**
+	 * Whether the email log has the status_reason column, adding it if an
+	 * existing install predates it.
+	 *
+	 * @return bool
+	 */
+	public static function email_log_has_status_reason_column()
+	{
+		static $has_column = null;
+
+		if ( null !== $has_column )
+		{
+			return $has_column;
+		}
+
+		if ( 'yes' === get_option( 'propertyhive_email_log_status_reason_column', '' ) )
+		{
+			$has_column = true;
+			return $has_column;
+		}
+
+		global $wpdb;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Schema check on the plugin-owned email queue table; the result is cached in an option.
+		$column = $wpdb->get_var( "SHOW COLUMNS FROM {$wpdb->prefix}ph_email_log LIKE 'status_reason'" );
+
+		if ( null === $column )
+		{
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.DirectDatabaseQuery.SchemaChange -- One-off addition of the diagnostic column to the plugin-owned email queue table for installs created before it existed.
+			$wpdb->query( "ALTER TABLE {$wpdb->prefix}ph_email_log ADD status_reason text NULL AFTER status" );
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Confirms the schema change above succeeded.
+			$column = $wpdb->get_var( "SHOW COLUMNS FROM {$wpdb->prefix}ph_email_log LIKE 'status_reason'" );
+		}
+
+		$has_column = ( null !== $column );
+
+		if ( $has_column )
+		{
+			update_option( 'propertyhive_email_log_status_reason_column', 'yes' );
+		}
+
+		return $has_column;
+	}
+
+	/**
+	 * Set a queued email's status, appending a timestamped reason to its log.
+	 *
+	 * @param int    $email_id Email log row ID.
+	 * @param string $status   New status.
+	 * @param string $reason   Why the status was set. Empty to leave the log unchanged.
+	 * @param string $existing Reason already stored on the row.
+	 */
+	private function set_email_log_status( $email_id, $status, $reason = '', $existing = '' )
+	{
+		global $wpdb;
+
+		$data = array( 'status' => $status, 'lock_id' => '' );
+		$formats = array( '%s', '%s' );
+
+		if ( '' !== $reason && self::email_log_has_status_reason_column() )
+		{
+			$line = '[' . gmdate( 'Y-m-d H:i:s' ) . ' UTC] ' . $reason;
+			$data['status_reason'] = ( '' !== (string) $existing ) ? $existing . "\n" . $line : $line;
+			$formats[] = '%s';
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The email queue is a custom plugin table; wpdb is the required API for updating its status.
+		$wpdb->update(
+			$wpdb->prefix . 'ph_email_log',
+			$data,
+			array( 'email_id' => (int) $email_id ),
+			$formats,
+			array( '%d' )
+		);
+	}
+
+	/**
+	 * Capture the error a mailer reports through wp_mail_failed.
+	 *
+	 * @param WP_Error $error Error passed by wp_mail().
+	 */
+	public function capture_mail_error( $error )
+	{
+		if ( is_wp_error( $error ) )
+		{
+			$messages = $error->get_error_messages();
+			$this->last_mail_error = implode( ' | ', array_filter( array_map( 'strval', $messages ) ) );
+			if ( '' === $this->last_mail_error )
+			{
+				$this->last_mail_error = (string) $error->get_error_code();
+			}
+		}
+	}
+
+	/**
+	 * Describe which file defines wp_mail(), so a replacement mailer is visible.
+	 *
+	 * @return string
+	 */
+	private function describe_wp_mail_source()
+	{
+		try
+		{
+			$reflection = new ReflectionFunction( 'wp_mail' );
+			$file = wp_normalize_path( (string) $reflection->getFileName() );
+		}
+		catch ( Exception $e )
+		{
+			return 'unknown';
+		}
+
+		foreach ( array( WP_PLUGIN_DIR, WPMU_PLUGIN_DIR, WP_CONTENT_DIR, ABSPATH ) as $base )
+		{
+			$base = trailingslashit( wp_normalize_path( $base ) );
+			if ( 0 === strpos( $file, $base ) )
+			{
+				return substr( $file, strlen( $base ) );
+			}
+		}
+
+		return basename( $file );
+	}
+
+	/**
 	 * Process ph_email_log table. Handle failed, hung and pending emails
 	 */
 	public function ph_process_email_log()
@@ -201,16 +328,33 @@ class PH_Emails {
 		$lock_id = uniqid( "", true );
 
 		$expired_lock = gmdate( 'Y-m-d H:i:s', strtotime( '24 hours ago' ) );
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The email queue is a custom plugin table and these bounded maintenance updates have no WordPress API equivalent.
-        $wpdb->query( $wpdb->prepare(
-            "UPDATE {$wpdb->prefix}ph_email_log SET status = 'fail2', lock_id = '' WHERE status = 'fail1' AND lock_id <> '' AND locked_at <= %s",
-            $expired_lock
-        ) );
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The email queue is a custom plugin table and these bounded maintenance updates have no WordPress API equivalent.
-        $wpdb->query( $wpdb->prepare(
-            "UPDATE {$wpdb->prefix}ph_email_log SET status = 'fail1', lock_id = '' WHERE status = '' AND lock_id <> '' AND locked_at <= %s",
-            $expired_lock
-        ) );
+		if ( self::email_log_has_status_reason_column() )
+		{
+			$stale_reason = '[' . gmdate( 'Y-m-d H:i:s' ) . ' UTC] Send did not finish within 24 hours (the queue run probably crashed or timed out part way through)';
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The email queue is a custom plugin table and these bounded maintenance updates have no WordPress API equivalent.
+	        $wpdb->query( $wpdb->prepare(
+	            "UPDATE {$wpdb->prefix}ph_email_log SET status = 'fail2', lock_id = '', status_reason = CONCAT_WS(%s, NULLIF(status_reason, ''), %s) WHERE status = 'fail1' AND lock_id <> '' AND locked_at <= %s",
+	            "\n", $stale_reason, $expired_lock
+	        ) );
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The email queue is a custom plugin table and these bounded maintenance updates have no WordPress API equivalent.
+	        $wpdb->query( $wpdb->prepare(
+	            "UPDATE {$wpdb->prefix}ph_email_log SET status = 'fail1', lock_id = '', status_reason = CONCAT_WS(%s, NULLIF(status_reason, ''), %s) WHERE status = '' AND lock_id <> '' AND locked_at <= %s",
+	            "\n", $stale_reason, $expired_lock
+	        ) );
+		}
+		else
+		{
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The email queue is a custom plugin table and these bounded maintenance updates have no WordPress API equivalent.
+	        $wpdb->query( $wpdb->prepare(
+	            "UPDATE {$wpdb->prefix}ph_email_log SET status = 'fail2', lock_id = '' WHERE status = 'fail1' AND lock_id <> '' AND locked_at <= %s",
+	            $expired_lock
+	        ) );
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The email queue is a custom plugin table and these bounded maintenance updates have no WordPress API equivalent.
+	        $wpdb->query( $wpdb->prepare(
+	            "UPDATE {$wpdb->prefix}ph_email_log SET status = 'fail1', lock_id = '' WHERE status = '' AND lock_id <> '' AND locked_at <= %s",
+	            $expired_lock
+	        ) );
+		}
 
         // Reserve a bounded batch before sending, so concurrent workers cannot send it twice.
         $process_limit = max( 1, min( 1000, (int) apply_filters( 'propertyhive_email_process_limit', 25 ) ) );
@@ -229,6 +373,7 @@ class PH_Emails {
 		foreach ( $emails_to_send as $email_to_send ) 
 		{
 			$email_id = $email_to_send->email_id;
+			$existing_reason = isset( $email_to_send->status_reason ) ? (string) $email_to_send->status_reason : '';
 
 			$contact_id = (int)$email_to_send->contact_id;
 
@@ -244,21 +389,30 @@ class PH_Emails {
 				&& isset( $applicant_profile['send_matching_properties'] )
 				&& 'yes' === $applicant_profile['send_matching_properties'];
 
+			$contact_status = get_post_status( $contact_id );
+
 			if (
-				'publish' !== get_post_status( $contact_id )
+				'publish' !== $contact_status
 				|| $email_forbidden
 				|| !$matching_enabled
 			) {
-				$wpdb->update(
-					$wpdb->prefix . 'ph_email_log',
-					array(
-						'status'  => 'fail2',
-						'lock_id' => '',
-					),
-					array( 'email_id' => (int)$email_id ),
-					array( '%s', '%s' ),
-					array( '%d' )
-				);
+				$skip_reasons = array();
+				if ( 'publish' !== $contact_status )
+				{
+					$skip_reasons[] = 'contact #' . $contact_id . ' is not published (status: ' . ( false === $contact_status ? 'not found' : $contact_status ) . ')';
+				}
+				if ( $email_forbidden )
+				{
+					$skip_reasons[] = 'contact #' . $contact_id . ' has "Email" selected as a forbidden contact method';
+				}
+				if ( !$matching_enabled )
+				{
+					$skip_reasons[] = is_array( $applicant_profile )
+						? 'applicant profile ' . (int)$email_to_send->applicant_profile_id . ' does not have "Send matching properties" enabled'
+						: 'applicant profile ' . (int)$email_to_send->applicant_profile_id . ' was not found on contact #' . $contact_id;
+				}
+
+				$this->set_email_log_status( $email_id, 'fail2', 'Not sent (skipped before sending): ' . implode( '; ', $skip_reasons ), $existing_reason );
 
 				continue;
 			}
@@ -284,15 +438,30 @@ class PH_Emails {
 
         	$body = apply_filters( 'propertyhive_mail_content', $this->style_inline( $this->wrap_message( $body, $email_to_send->contact_id ) ) );
 			
-			$sent = wp_mail( 
-				$email_to_send->to_email_address, 
-				$email_to_send->subject, 
-				$body, 
-				$headers/*,
-				string|array $attachments = array() */
-			);
+			$this->last_mail_error = '';
+			$exception_message = '';
+			add_action( 'wp_mail_failed', array( $this, 'capture_mail_error' ) );
+
+			try
+			{
+				$sent = wp_mail( 
+					$email_to_send->to_email_address, 
+					$email_to_send->subject, 
+					$body, 
+					$headers/*,
+					string|array $attachments = array() */
+				);
+			}
+			catch ( Throwable $e )
+			{
+				$sent = false;
+				$exception_message = get_class( $e ) . ': ' . $e->getMessage();
+			}
+
+			remove_action( 'wp_mail_failed', array( $this, 'capture_mail_error' ) );
 
 			$new_status = '';
+			$reason = '';
 			if ( $sent )
 			{
 				// Sent successfully
@@ -301,23 +470,36 @@ class PH_Emails {
 			else
 			{
 				// Failed to send
-				if ($email_to_send->status == '')
+				$attempt = ( $email_to_send->status == '' ) ? 1 : 2;
+				$new_status = ( 1 === $attempt ) ? 'fail1' : 'fail2';
+
+				$error = $exception_message;
+				if ( '' === $error )
 				{
-					$new_status = 'fail1';
+					$error = $this->last_mail_error;
 				}
-				else
+				if ( '' === $error )
 				{
-					$new_status = 'fail2';
+					global $phpmailer;
+					if ( is_object( $phpmailer ) && isset( $phpmailer->ErrorInfo ) && '' !== (string) $phpmailer->ErrorInfo )
+					{
+						$error = 'PHPMailer: ' . $phpmailer->ErrorInfo;
+					}
 				}
+				if ( '' === $error )
+				{
+					$error = 'wp_mail() returned false without reporting an error. Check the log of the plugin that sends email for this site';
+				}
+
+				$reason = 'Attempt ' . $attempt . ' failed: ' . $error
+					. ' [From: ' . $email_to_send->from_email_address
+					. '; To: ' . $email_to_send->to_email_address
+					. ( '' !== (string) $email_to_send->cc_email_address ? '; Cc: ' . $email_to_send->cc_email_address : '' )
+					. ( '' !== (string) $email_to_send->bcc_email_address ? '; Bcc: ' . $email_to_send->bcc_email_address : '' )
+					. '; wp_mail() defined in: ' . $this->describe_wp_mail_source() . ']';
 			}
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The email queue is a custom plugin table; wpdb is the required API for updating its status.
-			$wpdb->update(
-                $wpdb->prefix . 'ph_email_log',
-                array( 'status' => $new_status, 'lock_id' => '' ),
-                array( 'email_id' => (int) $email_id ),
-                array( '%s', '%s' ),
-                array( '%d' )
-            );
+
+			$this->set_email_log_status( $email_id, $new_status, $reason, $existing_reason );
 		}
 
 		// Delete old logs

@@ -594,7 +594,8 @@ class PH_Settings_Emails extends PH_Settings_Page {
                     </thead>
                     <tbody>
                    	<?php
-                        $query = "SELECT email_id, contact_id, to_email_address, subject, status, send_at
+                        $has_status_reason = PH_Emails::email_log_has_status_reason_column();
+                        $query = "SELECT email_id, contact_id, to_email_address, subject, status, " . ( $has_status_reason ? 'status_reason, ' : '' ) . "send_at
                             FROM {$wpdb->prefix}ph_email_log
                             WHERE %s = %s";
                         $query_args = array( '1', '1' );
@@ -635,6 +636,10 @@ class PH_Settings_Emails extends PH_Settings_Page {
 	                        		case "fail2": { echo 'Failed after 2 attempts'; break; }
 	                        		case "sent": { echo 'Sent'; break; }
 	                        		default: { echo 'Queued'; }
+	                        	}
+	                        	if ( isset( $email->status_reason ) && '' !== (string) $email->status_reason && 'sent' !== $email->status )
+	                        	{
+	                        		echo '<br><small style="display:block; margin-top:4px; color:#646970; word-break:break-word;">' . nl2br( esc_html( $email->status_reason ) ) . '</small>';
 	                        	}
 	                        ?></td>
 	                        <td class="actions">

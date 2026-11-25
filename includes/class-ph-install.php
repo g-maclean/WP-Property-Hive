@@ -788,6 +788,7 @@ Should you need to cancel or amend this appraisal, please do not hesitate to con
             lock_id varchar(23) NOT NULL,
             locked_at datetime NOT NULL DEFAULT '0000-00-00 00:00:00',
             status varchar(5) NOT NULL,
+            status_reason text NULL,
             send_at datetime NOT NULL DEFAULT '0000-00-00 00:00:00',
             sent_by bigint(20) unsigned NOT NULL,
             PRIMARY KEY  (email_id)
