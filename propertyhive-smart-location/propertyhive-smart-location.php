@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Property Hive Smart Location
  * Description: Fills a "smart suburb" field for each property using OpenStreetMap, with Claude AI as a fallback, compares it with the manually entered suburb, and can organise Location terms into a sensible hierarchy.
- * Version: 1.4.1
+ * Version: 1.5
  * Author: Property Hive
  * Requires at least: 5.6
  * Requires PHP: 7.2
@@ -15,11 +15,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 require_once __DIR__ . '/includes/class-phsl-logger.php';
 require_once __DIR__ . '/includes/class-phsl-organiser.php';
+require_once __DIR__ . '/includes/class-phsl-postcodes.php';
 
 final class PH_Smart_Location {
 
-	const VERSION       = '1.4.1';
-	const DB_VERSION    = '6';
+	const VERSION       = '1.5';
+	const DB_VERSION    = '7';
 	const OPTION        = 'phsl_settings';
 	const PAGE_SLUG     = 'ph-smart-location';
 	const NONCE         = 'phsl_nonce';
@@ -36,7 +37,8 @@ final class PH_Smart_Location {
 	 * Tracking uses two small post meta keys:
 	 * _phsl_status: assigned | suggested | not_found | error | skipped | retry
 	 * _phsl:        flags: t (time), o (OSM: 1 suburb found / 0 none / x failed),
-	 *               a (Claude: used | unsure | error | nokey), src (osm:suburb | claude),
+	 *               a (Claude: used | unsure | error | nokey), src (postcode | postcode+osm |
+	 *               postcode+claude | postcode-top | osm:suburb | claude), pl (s = postcode sector),
 	 *               cf (Claude confidence), n (retry count),
 	 *               v (pending suggestion: n => suburb, nb => neighbourhood, q => quarter)
 	 * Everything else goes to the log file.
@@ -73,6 +75,9 @@ final class PH_Smart_Location {
 	/** @var PHSL_Organiser */
 	public $organiser;
 
+	/** @var PHSL_Postcodes */
+	public $postcodes;
+
 	public static function instance() {
 		if ( null === self::$instance ) {
 			self::$instance = new self();
@@ -99,6 +104,7 @@ final class PH_Smart_Location {
 		add_action( 'wp_ajax_phsl_test', array( $this, 'ajax_test' ) );
 
 		$this->organiser = new PHSL_Organiser( $this );
+		$this->postcodes = new PHSL_Postcodes( $this );
 
 		foreach ( array( 'save_settings', 'apply', 'apply_all', 'retry', 'requeue', 'export', 'clear_log', 'download_log' ) as $action ) {
 			add_action( 'admin_post_phsl_' . $action, array( $this, 'handle_' . $action ) );
@@ -156,6 +162,9 @@ final class PH_Smart_Location {
 				$this->log( 'info', sprintf( 'Upgraded: smart suburb field renamed from smart_suburb to _smart_suburb (%d values moved).', $moved ) );
 			}
 		}
+		if ( $version && version_compare( $version, '7', '<' ) && ! get_option( PHSL_Postcodes::MAP ) ) {
+			$this->postcodes->generate(); // postcode list is now the first lookup
+		}
 		if ( self::DB_VERSION !== $version ) {
 			update_option( 'phsl_db_version', self::DB_VERSION, false );
 		}
@@ -181,6 +190,8 @@ final class PH_Smart_Location {
 			'statuses'              => array( 'publish' ),
 			'smart_key'             => '_smart_suburb',
 			'manual_key'            => '_suburb',
+			'postcode_enabled'      => 1,
+			'postcode_sector'       => 1,
 			'neighbourhood_enabled' => 0,
 			'neighbourhood_key'     => '_neighbourhood',
 			'quarter_enabled'       => 0,
@@ -258,6 +269,8 @@ final class PH_Smart_Location {
 			'statuses'              => $statuses ? $statuses : array( 'publish' ),
 			'smart_key'             => self::sanitize_meta_key( $p['smart_key'] ?? '_smart_suburb', '_smart_suburb' ),
 			'manual_key'            => self::sanitize_meta_key( $p['manual_key'] ?? '_suburb', '_suburb' ),
+			'postcode_enabled'      => empty( $p['postcode_enabled'] ) ? 0 : 1,
+			'postcode_sector'       => empty( $p['postcode_sector'] ) ? 0 : 1,
 			'neighbourhood_enabled' => empty( $p['neighbourhood_enabled'] ) ? 0 : 1,
 			'neighbourhood_key'     => self::sanitize_meta_key( $p['neighbourhood_key'] ?? '_neighbourhood', '_neighbourhood' ),
 			'quarter_enabled'       => empty( $p['quarter_enabled'] ) ? 0 : 1,
@@ -386,6 +399,20 @@ final class PH_Smart_Location {
 			}
 		}
 		return 'mismatch';
+	}
+
+	/** Human-readable label for a smart suburb source. */
+	public static function source_label( $src, $level = '' ) {
+		$list   = 's' === $level ? 'postcode sector list' : 'postcode list';
+		$labels = array(
+			'postcode'        => ucfirst( $list ),
+			'postcode+osm'    => ucfirst( $list ) . ' + OpenStreetMap',
+			'postcode+claude' => ucfirst( $list ) . ' + Claude',
+			'postcode-top'    => ucfirst( $list ) . ' (most common)',
+			'osm:suburb'      => 'OpenStreetMap',
+			'claude'          => 'Claude',
+		);
+		return $labels[ $src ] ?? (string) $src;
 	}
 
 	/** Spellings already used for suburbs (manual field first, then smart field): normalised => spelling. */
@@ -551,6 +578,8 @@ final class PH_Smart_Location {
 					'smart_state' => $state,
 					'comparison'  => self::compare( $manual, $smart, $checked ),
 					'src'         => (string) ( $st['src'] ?? '' ),
+					'pl'          => (string) ( $st['pl'] ?? '' ),
+					'postcode_list' => PHSL_Postcodes::format( $this->postcodes->lookup( (string) get_post_meta( $pid, '_address_postcode', true ), $manual, (bool) $s['postcode_sector'] )['candidates'] ),
 					'confidence'  => $conf[ $st['cf'] ?? '' ] ?? '',
 					'status'      => $status,
 				);
@@ -648,6 +677,7 @@ final class PH_Smart_Location {
 			'suburb'      => '',
 			'src'         => '',
 			'cf'          => '',
+			'pl'          => '',
 			'extras'      => array(),
 			'o'           => null,
 			'a'           => null,
@@ -664,28 +694,55 @@ final class PH_Smart_Location {
 			return $this->finish( $r, $dry_run );
 		}
 
-		/* 1. OpenStreetMap */
-		$osm = $this->osm_lookup( $pid );
-		if ( is_wp_error( $osm ) ) {
-			$code         = $osm->get_error_code();
-			$r['notes'][] = 'OSM: ' . $osm->get_error_message();
-			if ( in_array( $code, array( 'rate_limited', 'blocked' ), true ) ) {
-				$r['status'] = 'retry';
-				$r['halt']   = true;
-				return $this->finish( $r, $dry_run );
+		/* 1. Postcode list (built from the manual suburbs) */
+		$cands = array();
+		$pl    = '';
+		if ( $need_suburb && $s['postcode_enabled'] ) {
+			// Leave this property's own manual suburb out of the counts, so it isn't matched against itself.
+			$lookup = $this->postcodes->lookup( $postcode, self::meta_values( $pid, $s['manual_key'] ), (bool) $s['postcode_sector'] );
+			$cands  = $lookup['candidates'];
+			$pl     = 'sector' === $lookup['level'] ? 's' : '';
+			if ( $cands ) {
+				$r['context']['postcode'] = array( 'matched' => $lookup['key'], 'level' => $lookup['level'], 'suburbs' => $cands ) + ( empty( $lookup['override'] ) ? array() : array( 'your_edit' => true ) );
 			}
-			$r['o'] = in_array( $code, array( 'no_location', 'not_found' ), true ) ? 0 : 'x';
-			if ( 'x' === $r['o'] && ( ! $need_suburb || ! self::claude_enabled() ) ) {
-				$r['status'] = 'retry';
-				return $this->finish( $r, $dry_run );
+		}
+		$single = 1 === count( $cands );
+		if ( $need_suburb && $single ) {
+			$r['suburb'] = (string) key( $cands );
+			$r['src']    = 'postcode';
+			$r['pl']     = $pl;
+		}
+
+		/* 2. OpenStreetMap – only when it can add something */
+		$osm = array( 'address' => array(), 'source' => 'none' );
+		if ( $extra_fields || ( $need_suburb && ! $single ) ) {
+			$looked = $this->osm_lookup( $pid );
+			if ( is_wp_error( $looked ) ) {
+				$code         = $looked->get_error_code();
+				$r['notes'][] = 'OSM: ' . $looked->get_error_message();
+				if ( in_array( $code, array( 'rate_limited', 'blocked' ), true ) ) {
+					$r['status'] = 'retry';
+					$r['halt']   = true;
+					return $this->finish( $r, $dry_run );
+				}
+				$r['o'] = in_array( $code, array( 'no_location', 'not_found' ), true ) ? 0 : 'x';
+				if ( 'x' === $r['o'] && ! $cands && ! $single && ( ! $need_suburb || ! self::claude_enabled() ) ) {
+					$r['status'] = 'retry';
+					return $this->finish( $r, $dry_run );
+				}
+			} else {
+				$osm = $looked;
 			}
-			$osm = array( 'address' => array(), 'source' => 'none' );
 		}
 		$address                  = $osm['address'];
 		$r['context']['osm']      = array_intersect_key( $address, array_flip( self::$osm_context_fields ) );
 		$r['context']['osm_from'] = $osm['source'];
 		if ( '' === $postcode && ! empty( $address['postcode'] ) ) {
 			$postcode = (string) $address['postcode'];
+		}
+		$osm_suburb = ( ! empty( $address['suburb'] ) && is_string( $address['suburb'] ) ) ? trim( $address['suburb'] ) : '';
+		if ( null === $r['o'] && 'none' !== $osm['source'] ) {
+			$r['o'] = '' !== $osm_suburb ? 1 : 0;
 		}
 
 		foreach ( $extra_fields as $f => $key ) {
@@ -694,55 +751,56 @@ final class PH_Smart_Location {
 			}
 		}
 
-		if ( $need_suburb ) {
-			if ( ! empty( $address['suburb'] ) && is_string( $address['suburb'] ) ) {
-				$r['suburb'] = trim( $address['suburb'] );
-				$r['src']    = 'osm:suburb';
-			}
-			if ( null === $r['o'] ) {
-				$r['o'] = '' !== $r['suburb'] ? 1 : 0;
-			}
-
-			/* 2. Claude, when OpenStreetMap has no suburb */
-			if ( '' === $r['suburb'] && $s['use_claude'] ) {
-				if ( ! self::claude_enabled() ) {
-					$r['a']       = 'nokey';
-					$r['notes'][] = 'Claude skipped: no API key';
+		if ( $need_suburb && ! $single ) {
+			if ( $cands ) {
+				/* Several suburbs for this postcode: OSM picks, then Claude, else the most common */
+				foreach ( array_keys( $cands ) as $name ) {
+					if ( '' !== $osm_suburb && self::normalise( $name ) === self::normalise( $osm_suburb ) ) {
+						$r['suburb'] = $name;
+						$r['src']    = 'postcode+osm';
+						break;
+					}
+				}
+				if ( '' === $r['suburb'] ) {
+					$c = $this->ask_claude( $r, $pid, $postcode, $osm, $cands );
+					if ( ! empty( $r['halt'] ) ) {
+						return $this->finish( $r, $dry_run );
+					}
+					if ( '' !== $c ) {
+						$r['suburb'] = $c;
+						$r['src']    = 'postcode+claude';
+					}
+				}
+				if ( '' === $r['suburb'] ) {
+					$r['suburb']  = (string) key( $cands );
+					$r['src']     = 'postcode-top';
+					$r['notes'][] = 'most common suburb for the postcode (' . PHSL_Postcodes::format( $cands ) . ')';
+				}
+				$r['pl'] = $pl;
+			} else {
+				/* Postcode not in the list: OSM, then Claude */
+				if ( '' !== $osm_suburb ) {
+					$r['suburb'] = $osm_suburb;
+					$r['src']    = 'osm:suburb';
 				} else {
-					$c = $this->claude_lookup( $pid, $postcode, $osm );
-					if ( is_wp_error( $c ) ) {
-						$r['a']       = 'error';
-						$r['notes'][] = 'Claude: ' . $c->get_error_message();
-						if ( 'claude_auth' === $c->get_error_code() ) {
-							$r['status'] = 'retry';
-							$r['halt']   = true;
-							return $this->finish( $r, $dry_run );
-						}
-					} else {
-						$r['context']['claude'] = $c;
-						$ranks     = array( 'low' => 1, 'medium' => 2, 'high' => 3 );
-						$confident = ( $ranks[ $c['confidence'] ] ?? 0 ) >= $ranks[ $s['claude_min_confidence'] ];
-						$r['a']    = $confident ? 'used' : 'unsure';
-						$r['cf']   = substr( $c['confidence'], 0, 1 );
-						if ( '' !== $c['suburb'] ) {
-							if ( $confident ) {
-								$r['suburb'] = $c['suburb'];
-								$r['src']    = 'claude';
-							} else {
-								$r['notes'][] = sprintf( 'Claude suggested "%s" with low confidence (not used)', $c['suburb'] );
-							}
-						}
+					$c = $this->ask_claude( $r, $pid, $postcode, $osm, array() );
+					if ( ! empty( $r['halt'] ) ) {
+						return $this->finish( $r, $dry_run );
+					}
+					if ( '' !== $c ) {
+						$r['suburb'] = $c;
+						$r['src']    = 'claude';
 					}
 				}
 			}
+		}
 
-			/* 3. Use the spelling already used on the site, if any */
-			if ( '' !== $r['suburb'] ) {
-				$vocab = $this->vocab();
-				$n     = self::normalise( $r['suburb'] );
-				if ( isset( $vocab[ $n ] ) ) {
-					$r['suburb'] = $vocab[ $n ];
-				}
+		/* 3. Use the spelling already used on the site, if any */
+		if ( '' !== $r['suburb'] ) {
+			$vocab = $this->vocab();
+			$n     = self::normalise( $r['suburb'] );
+			if ( isset( $vocab[ $n ] ) ) {
+				$r['suburb'] = $vocab[ $n ];
 			}
 		}
 
@@ -757,6 +815,46 @@ final class PH_Smart_Location {
 			$this->save_values( $pid, $r );
 		}
 		return $this->finish( $r, $dry_run );
+	}
+
+	/**
+	 * Ask Claude for the suburb (optionally choosing between $cands) and record the outcome on $r.
+	 *
+	 * @return string The suburb to use, or '' (sets $r['halt'] if the API key is rejected).
+	 */
+	private function ask_claude( &$r, $pid, $postcode, $osm, $cands ) {
+		$s = self::settings();
+		if ( ! $s['use_claude'] ) {
+			return '';
+		}
+		if ( ! self::claude_enabled() ) {
+			$r['a']       = 'nokey';
+			$r['notes'][] = 'Claude skipped: no API key';
+			return '';
+		}
+		$c = $this->claude_lookup( $pid, $postcode, $osm, $cands );
+		if ( is_wp_error( $c ) ) {
+			$r['a']       = 'error';
+			$r['notes'][] = 'Claude: ' . $c->get_error_message();
+			if ( 'claude_auth' === $c->get_error_code() ) {
+				$r['status'] = 'retry';
+				$r['halt']   = true;
+			}
+			return '';
+		}
+		$r['context']['claude'] = $c;
+		$ranks     = array( 'low' => 1, 'medium' => 2, 'high' => 3 );
+		$confident = ( $ranks[ $c['confidence'] ] ?? 0 ) >= $ranks[ $s['claude_min_confidence'] ];
+		$r['a']    = $confident ? 'used' : 'unsure';
+		$r['cf']   = substr( $c['confidence'], 0, 1 );
+		if ( '' === $c['suburb'] ) {
+			return '';
+		}
+		if ( ! $confident ) {
+			$r['notes'][] = sprintf( 'Claude suggested "%s" with low confidence (not used)', $c['suburb'] );
+			return '';
+		}
+		return $c['suburb'];
 	}
 
 	/** Save values – only into empty fields, so manual edits are never overwritten. */
@@ -787,7 +885,7 @@ final class PH_Smart_Location {
 
 		$parts = array();
 		if ( '' !== $r['suburb'] ) {
-			$parts[] = sprintf( 'smart suburb "%s" from %s', $r['suburb'], 'claude' === $r['src'] ? 'Claude' : 'OSM' );
+			$parts[] = sprintf( 'smart suburb "%s" from %s', $r['suburb'], self::source_label( $r['src'], $r['pl'] ) );
 		}
 		foreach ( $r['extras'] as $f => $v ) {
 			$parts[] = sprintf( '%s "%s"', $f, $v );
@@ -818,6 +916,7 @@ final class PH_Smart_Location {
 			'a'   => $r['a'],
 			'src' => $r['src'],
 			'cf'  => $r['cf'],
+			'pl'  => $r['pl'],
 			'n'   => 'retry' === $r['status'] ? $r['n'] : null,
 		);
 		if ( 'suggested' === $r['status'] ) {
@@ -941,7 +1040,7 @@ final class PH_Smart_Location {
 	 *
 	 * @return array|WP_Error array( suburb, confidence, reason, model, input_tokens, output_tokens )
 	 */
-	private function claude_lookup( $pid, $postcode, $osm ) {
+	private function claude_lookup( $pid, $postcode, $osm, $cands = array() ) {
 		$s = self::settings();
 
 		$lines = array( 'Address: ' . $this->address_query( $pid ) );
@@ -964,10 +1063,14 @@ final class PH_Smart_Location {
 			}
 		}
 		$lines[] = 'OpenStreetMap areas at this location: ' . ( $areas ? implode( ', ', $areas ) : 'none' );
-		$tasks   = array();
-		$tasks[] = 'Identify the suburb: the locally recognised district or area name an estate agent would use for this address (for example "Edgbaston" or "Kings Norton"). Do not give the city, county, a building, a road or a housing development name. OpenStreetMap data may be missing or wrong; use your own knowledge of the area. If you are not reasonably sure, return an empty suburb.';
+		$tasks = array();
+		if ( $cands ) {
+			$tasks[] = "The agency's other properties at this postcode use these suburbs (number of properties): " . PHSL_Postcodes::format( $cands ) . ". Which one is this property in? Answer with one of those names exactly, or an empty suburb if you can't tell. OpenStreetMap data may be missing or wrong; use your own knowledge of the area.";
+		} else {
+			$tasks[] = 'Identify the suburb: the locally recognised district or area name an estate agent would use for this address (for example "Edgbaston" or "Kings Norton"). Do not give the city, county, a building, a road or a housing development name. OpenStreetMap data may be missing or wrong; use your own knowledge of the area. If you are not reasonably sure, return an empty suburb.';
+		}
 		$properties = array(
-			'suburb'     => array( 'type' => 'string' ),
+			'suburb'     => $cands ? array( 'type' => 'string', 'enum' => array_merge( array_map( 'strval', array_keys( $cands ) ), array( '' ) ) ) : array( 'type' => 'string' ),
 			'confidence' => array( 'type' => 'string', 'enum' => array( 'high', 'medium', 'low' ) ),
 			'reason'     => array( 'type' => 'string' ),
 		);
@@ -1263,14 +1366,13 @@ final class PH_Smart_Location {
 
 		$out = fopen( 'php://output', 'w' );
 		fwrite( $out, "\xEF\xBB\xBF" ); // UTF-8 BOM so Excel shows names like "King’s Norton" correctly
-		$header = array( 'Property ID', 'Property', 'Postcode', 'Manual suburb', 'Smart suburb', 'Comparison', 'Smart suburb status', 'Smart suburb source', 'Claude confidence', 'Lookup status' );
+		$header = array( 'Property ID', 'Property', 'Postcode', 'Manual suburb', 'Smart suburb', 'Comparison', 'Smart suburb status', 'Smart suburb source', 'Claude confidence', 'Lookup status', 'Postcode list suburbs (excluding this property)' );
 		$extras = self::extra_fields();
 		foreach ( $extras as $f => $key ) {
 			$header[] = ucfirst( $f );
 		}
 		fputcsv( $out, $header );
 
-		$sources = array( 'osm:suburb' => 'OpenStreetMap', 'claude' => 'Claude' );
 		$status  = array( 'not_found' => 'nothing found' );
 		foreach ( $rows as $row ) {
 			if ( '' !== $only && $row['comparison'] !== $only ) {
@@ -1284,9 +1386,10 @@ final class PH_Smart_Location {
 				$row['smart'],
 				$row['comparison'],
 				$row['smart_state'],
-				$sources[ $row['src'] ] ?? $row['src'],
+				self::source_label( $row['src'], $row['pl'] ),
 				$row['confidence'],
 				$status[ $row['status'] ] ?? $row['status'],
+				$row['postcode_list'],
 			);
 			foreach ( $extras as $key ) {
 				$line[] = implode( ', ', self::meta_values( $row['id'], $key ) );
@@ -1373,7 +1476,7 @@ final class PH_Smart_Location {
 		if ( ! $this->user_can() ) {
 			wp_die( 'Sorry, you are not allowed to access this page.' );
 		}
-		$tabs = array( 'run' => 'Overview', 'results' => 'Results', 'organise' => 'Organise Locations', 'log' => 'Log', 'settings' => 'Settings' );
+		$tabs = array( 'run' => 'Overview', 'results' => 'Results', 'postcodes' => 'Postcodes', 'organise' => 'Organise Locations', 'log' => 'Log', 'settings' => 'Settings' );
 		$tab  = sanitize_key( $_GET['tab'] ?? 'run' );
 		$tab  = isset( $tabs[ $tab ] ) ? $tab : 'run';
 		$msgs = array(
@@ -1382,6 +1485,9 @@ final class PH_Smart_Location {
 			'retry'          => 'Property queued to be processed again.',
 			'requeued'       => 'Properties re-queued.',
 			'log_cleared'    => 'Log files deleted.',
+			'postcodes_generated' => 'Postcode list generated from the manual suburbs.',
+			'postcodes_saved'     => 'Postcode saved.',
+			'postcodes_invalid'   => 'That isn’t a valid UK postcode.',
 			'organised'      => 'Location changes applied. Use “Undo last apply” to reverse them.',
 			'organise_undone' => 'Last organise undone.',
 			'organise_discarded' => 'Proposal discarded.',
@@ -1391,7 +1497,7 @@ final class PH_Smart_Location {
 		echo '<div class="wrap phsl-wrap"><h1>Smart Location</h1>';
 		$msg = sanitize_key( $_GET['phsl_msg'] ?? '' );
 		if ( isset( $msgs[ $msg ] ) ) {
-			echo '<div class="notice ' . ( 'apply_failed' === $msg ? 'notice-error' : 'notice-success' ) . ' is-dismissible"><p>' . esc_html( $msgs[ $msg ] ) . '</p></div>';
+			echo '<div class="notice ' . ( in_array( $msg, array( 'apply_failed', 'postcodes_invalid' ), true ) ? 'notice-error' : 'notice-success' ) . ' is-dismissible"><p>' . esc_html( $msgs[ $msg ] ) . '</p></div>';
 		}
 		echo '<nav class="nav-tab-wrapper">';
 		foreach ( $tabs as $k => $label ) {
@@ -1400,6 +1506,8 @@ final class PH_Smart_Location {
 		echo '</nav>';
 		if ( 'organise' === $tab ) {
 			$this->organiser->render();
+		} elseif ( 'postcodes' === $tab ) {
+			$this->postcodes->render();
 		} else {
 			call_user_func( array( $this, 'render_' . $tab ) );
 		}
@@ -1433,7 +1541,7 @@ final class PH_Smart_Location {
 					<span class="phsl-badge phsl-suggested">Suggest only</span>: nothing is saved; review suggestions on the Results tab.
 				<?php endif; ?>
 			</p>
-			<p><strong>Smart suburb:</strong> OpenStreetMap suburb
+			<p><strong>Smart suburb:</strong> <?php echo $s['postcode_enabled'] ? 'postcode list (' . esc_html( number_format_i18n( count( (array) get_option( PHSL_Postcodes::MAP, array() ) ) ) ) . ' postcodes), then ' : ''; ?>OpenStreetMap suburb
 				<?php if ( self::claude_enabled() ) : ?>, then <strong><?php echo esc_html( self::$models[ $s['claude_model'] ] ); ?></strong>.
 				<?php elseif ( $s['use_claude'] ) : ?>. <span class="phsl-warn">Claude is enabled but there is no API key.</span>
 				<?php else : ?>. Claude is off.<?php endif; ?>
@@ -1471,7 +1579,7 @@ final class PH_Smart_Location {
 				<?php $this->post_button( 'phsl_export', 'Export all (CSV)', array(), 'button button-primary' ); ?>
 				<?php $this->post_button( 'phsl_export', 'Export mismatches only', array( 'comparison' => 'mismatch' ) ); ?>
 			</p>
-			<p class="description">The CSV has the manual suburb, smart suburb and comparison side by side, plus where the smart suburb came from and Claude’s confidence.</p>
+			<p class="description">The CSV has the manual suburb, smart suburb and comparison side by side, plus where the smart suburb came from, Claude’s confidence, and the suburbs the postcode list has for that postcode.</p>
 		</div>
 
 		<div class="phsl-card">
@@ -1595,7 +1703,7 @@ final class PH_Smart_Location {
 						<?php if ( ! empty( $st['t'] ) ) : ?><br><small><?php echo esc_html( wp_date( 'j M Y H:i', $st['t'] ) ); ?></small><?php endif; ?></td>
 					<td><?php echo $manual ? esc_html( implode( ', ', $manual ) ) : '–'; ?></td>
 					<td><?php echo '' !== $smart ? esc_html( $smart ) : '–'; ?>
-						<?php if ( ! empty( $st['src'] ) ) : ?><br><small><?php echo esc_html( 'claude' === $st['src'] ? 'Claude' . ( ! empty( $st['cf'] ) ? ', ' . ( $conf[ $st['cf'] ] ?? '' ) . ' confidence' : '' ) : 'OpenStreetMap' ); ?><?php echo $suggested ? ' · <strong>suggested</strong>' : ''; ?></small><?php endif; ?></td>
+						<?php if ( ! empty( $st['src'] ) ) : ?><br><small><?php echo esc_html( self::source_label( $st['src'], $st['pl'] ?? '' ) . ( false !== strpos( $st['src'], 'claude' ) && ! empty( $st['cf'] ) ? ', ' . ( $conf[ $st['cf'] ] ?? '' ) . ' confidence' : '' ) ); ?><?php echo $suggested ? ' · <strong>suggested</strong>' : ''; ?></small><?php endif; ?></td>
 					<td><span class="phsl-badge phsl-cmp-<?php echo esc_attr( str_replace( ' ', '-', $cmp ) ); ?>"><?php echo esc_html( $cmp ); ?></span></td>
 					<?php foreach ( $extras as $f => $key ) : ?>
 						<td><?php echo esc_html( $pending ? ( $v[ 'neighbourhood' === $f ? 'nb' : 'q' ] ?? '–' ) : ( implode( ', ', self::meta_values( $pid, $key ) ) ?: '–' ) ); ?></td>
@@ -1734,6 +1842,18 @@ final class PH_Smart_Location {
 					<th scope="row"><label for="phsl-manual-key">Manual suburb field</label></th>
 					<td><input type="text" id="phsl-manual-key" name="manual_key" class="regular-text code phsl-short" value="<?php echo esc_attr( $s['manual_key'] ); ?>">
 						<p class="description">The manually entered suburb, used only for the comparison and the CSV export – never changed. Where the same suburb already exists with a particular spelling (in either field), that spelling is used.</p></td>
+				</tr>
+			</table>
+
+			<h2>Postcode list</h2>
+			<table class="form-table" role="presentation">
+				<tr>
+					<th scope="row">Postcode lookup</th>
+					<td>
+						<label class="phsl-block"><input type="checkbox" name="postcode_enabled" value="1" <?php checked( $s['postcode_enabled'] ); ?>> Check the postcode list first (built from the manual suburbs – see the Postcodes tab)</label>
+						<label class="phsl-block"><input type="checkbox" name="postcode_sector" value="1" <?php checked( $s['postcode_sector'] ); ?>> If the full postcode isn’t in the list, use its postcode sector (e.g. “B30 2”)</label>
+						<p class="description">One suburb for the postcode: used straight away. Several: OpenStreetMap picks, then Claude, otherwise the most common. None: OpenStreetMap, then Claude.</p>
+					</td>
 				</tr>
 			</table>
 

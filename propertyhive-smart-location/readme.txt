@@ -1,14 +1,23 @@
-=== Property Hive Smart Location 1.4.1 ===
+=== Property Hive Smart Location 1.5 ===
 
 Fills a "smart suburb" field (meta key _smart_suburb by default) for each property, compares it with
 the manually entered suburb (_suburb by default), and can organise Location terms into a hierarchy.
 It never touches the Location taxonomy assignments or the manual suburb field.
 
 How the smart suburb is found
-1. OpenStreetMap reverse lookup (coordinates; address search if none), max 1 request/second.
-   The smart suburb is OSM's "suburb".
-2. If OSM has none, Claude is asked (answers below the minimum confidence are not used).
-3. If the same suburb is already used on the site (in either field) with a particular spelling,
+1. Postcode list (first). Built from the manual suburb field: for each full postcode, the suburbs
+   used by properties there and how many (one postcode can have several). See the Postcodes tab:
+   generate / rebuild, search, and your own edits (kept separately, survive a rebuild; "-" ignores
+   a postcode). If the full postcode isn't listed, its sector (e.g. "B30 2") is used (optional).
+   - one suburb: used, no other lookups
+   - several: OpenStreetMap's suburb picks one of them; otherwise Claude chooses (restricted to
+     those names); otherwise the most common is used (marked as such)
+   When an existing property is checked, its own manual suburb is left out of the counts so it
+   isn't matched against itself - the comparison stays an honest test.
+2. Postcode not in the list: OpenStreetMap reverse lookup (coordinates; address search if none),
+   max 1 request/second - OSM's "suburb".
+3. If OSM has none, Claude is asked (answers below the minimum confidence are not used).
+4. If the same suburb is already used on the site (in either field) with a particular spelling,
    that spelling is used ("King's Norton" -> "Kings Norton").
 Fields are only ever filled when EMPTY, so a smart suburb edited by hand is never overwritten.
 To redo one, clear the field and click Retry. Optional neighbourhood / quarter custom fields are
@@ -26,7 +35,9 @@ Comparison (Overview tab, Results tab filter, CSV export)
 In Suggest mode the pending suggestion is compared (marked "suggested" in the export).
 
 CSV export columns: Property ID, Property, Postcode, Manual suburb, Smart suburb, Comparison,
-Smart suburb status (saved/suggested), Smart suburb source, Claude confidence, Lookup status,
+Smart suburb status (saved/suggested), Smart suburb source (postcode list / sector list, + OSM /
++ Claude / most common, OpenStreetMap, Claude), Claude confidence, Lookup status, the postcode
+list's suburbs for that postcode (excluding the property itself),
 plus any enabled neighbourhood/quarter fields. "Export all" or one comparison value at a time.
 
 Modes: Suggest only (default; review on the Results tab, Apply / Apply all) or Assign automatically.
@@ -44,6 +55,8 @@ Review the proposed tree and moves, apply selected, undo the last apply. Never r
 
 Post meta: _phsl_status (one word) and _phsl (small flags array). Detail goes to monthly log files
 in wp-content/uploads/ph-smart-location-logs/ (protected), viewable on the Log tab.
+
+Upgrading to 1.5: the postcode list is generated automatically the first time.
 
 Upgrading from 1.4: values saved under the old default key smart_suburb are renamed to
 _smart_suburb (unless a different key had been set in Settings).
