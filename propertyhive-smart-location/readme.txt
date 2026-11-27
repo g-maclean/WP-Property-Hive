@@ -1,4 +1,4 @@
-=== Property Hive Smart Location 1.6 ===
+=== Property Hive Smart Location 1.6.1 ===
 
 Fills a "smart suburb" field (meta key _smart_suburb by default) for each property, compares it with
 the manually entered suburb (_suburb by default), and can organise Location terms into a hierarchy.
@@ -58,8 +58,8 @@ Post meta: _phsl_status (one word) and _phsl (small flags array). Detail goes to
 in wp-content/uploads/ph-smart-location-logs/ (protected), viewable on the Log tab.
 
 Starting again from scratch
-Happens automatically on install / activation and when updating to 1.6, and from the Overview tab
-("Start again from scratch"):
+Happens once, automatically, when a site is updated to 1.6 (not on every activation), and can be
+run again at any time with "Start again from scratch" on the Overview tab:
 - smart suburbs Smart Location wrote are cleared; ones edited by hand since are kept (from 1.6 the
   saved value is recorded so this can be told apart - values saved by 1.5 and earlier are treated
   as plugin-written), and values on properties Smart Location never assigned are kept

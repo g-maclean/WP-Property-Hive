@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Property Hive Smart Location
  * Description: Fills a "smart suburb" field for each property using OpenStreetMap, with Claude AI as a fallback, compares it with the manually entered suburb, and can organise Location terms into a sensible hierarchy.
- * Version: 1.6
+ * Version: 1.6.1
  * Author: Property Hive
  * Requires at least: 5.6
  * Requires PHP: 7.2
@@ -19,7 +19,7 @@ require_once __DIR__ . '/includes/class-phsl-postcodes.php';
 
 final class PH_Smart_Location {
 
-	const VERSION       = '1.6';
+	const VERSION       = '1.6.1';
 	const DB_VERSION    = '8';
 	const OPTION        = 'phsl_settings';
 	const PAGE_SLUG     = 'ph-smart-location';
@@ -126,8 +126,6 @@ final class PH_Smart_Location {
 		if ( ! get_option( 'phsl_db_version' ) ) {
 			update_option( 'phsl_db_version', self::DB_VERSION, false );
 		}
-		// Every install / activation starts from scratch with a freshly built postcode list.
-		self::instance()->reset_all( 'plugin activated' );
 	}
 
 	public static function deactivate() {
@@ -169,7 +167,7 @@ final class PH_Smart_Location {
 			$this->postcodes->generate(); // postcode list is now the first lookup
 		}
 		if ( $version && version_compare( $version, '8', '<' ) ) {
-			// Updating a plugin doesn't run its activation step, so start from scratch here too.
+			// One-time reset when updating to 1.6: re-run everything with the postcode list.
 			update_option( 'phsl_db_version', self::DB_VERSION, false );
 			$this->reset_all( 'plugin updated' );
 		}
@@ -1677,7 +1675,7 @@ final class PH_Smart_Location {
 				$this->post_button( 'phsl_reset_all', 'Start again from scratch', array(), 'button button-link-delete', 'Clear every smart suburb Smart Location saved (ones edited by hand are kept), reset all tracking and rebuild the postcode list? Then run “Process existing properties” to fill them in again.' );
 				?>
 			</p>
-			<p class="description"><strong>Start again from scratch</strong> also happens automatically when the plugin is installed, activated or updated.</p>
+
 			<p class="description">To redo a property’s smart suburb, clear its <code><?php echo esc_html( $s['smart_key'] ); ?></code> field and click Retry on the Results tab.</p>
 		</div>
 
