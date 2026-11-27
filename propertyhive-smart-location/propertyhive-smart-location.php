@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Property Hive Smart Location
  * Description: Fills a "smart suburb" field for each property using OpenStreetMap, with Claude AI as a fallback, compares it with the manually entered suburb, and can organise Location terms into a sensible hierarchy.
- * Version: 1.6.1
+ * Version: 1.7
  * Author: Property Hive
  * Requires at least: 5.6
  * Requires PHP: 7.2
@@ -19,7 +19,7 @@ require_once __DIR__ . '/includes/class-phsl-postcodes.php';
 
 final class PH_Smart_Location {
 
-	const VERSION       = '1.6.1';
+	const VERSION       = '1.7';
 	const DB_VERSION    = '8';
 	const OPTION        = 'phsl_settings';
 	const PAGE_SLUG     = 'ph-smart-location';
@@ -58,7 +58,7 @@ final class PH_Smart_Location {
 
 	/** Comparison values, in display order, with descriptions. */
 	public static $comparisons = array(
-		'match'         => 'Same suburb (ignoring case and punctuation), or one of several manual values',
+		'match'         => 'Same suburb (ignoring case and punctuation); with several values on either side, any one in common',
 		'near match'    => 'Same apart from a small spelling difference',
 		'partial match' => 'One name contains the other, e.g. “Harborne” / “Harborne Village”',
 		'mismatch'      => 'Both filled in, and different',
@@ -376,8 +376,8 @@ final class PH_Smart_Location {
 	 */
 	public static function compare( $manual, $smart, $checked ) {
 		$manual = array_values( array_filter( array_map( array( __CLASS__, 'normalise' ), (array) $manual ) ) );
-		$smart  = self::normalise( $smart );
-		if ( '' === $smart ) {
+		$smarts = array_values( array_filter( array_map( array( __CLASS__, 'normalise' ), self::split_values( $smart ) ) ) );
+		if ( ! $smarts ) {
 			if ( ! $checked ) {
 				return 'not checked';
 			}
@@ -386,6 +386,20 @@ final class PH_Smart_Location {
 		if ( ! $manual ) {
 			return 'smart only';
 		}
+		// Several smart suburbs (e.g. from Claude): the best result of any of them.
+		$rank = array( 'match' => 4, 'near match' => 3, 'partial match' => 2, 'mismatch' => 1 );
+		$best = 'mismatch';
+		foreach ( $smarts as $one ) {
+			$res = self::compare_one( $manual, $one );
+			if ( $rank[ $res ] > $rank[ $best ] ) {
+				$best = $res;
+			}
+		}
+		return $best;
+	}
+
+	/** One normalised smart suburb against the normalised manual values. */
+	private static function compare_one( $manual, $smart ) {
 		if ( in_array( $smart, $manual, true ) ) {
 			return 'match';
 		}
@@ -865,10 +879,12 @@ final class PH_Smart_Location {
 		/* 3. Use the spelling already used on the site, if any */
 		if ( '' !== $r['suburb'] ) {
 			$vocab = $this->vocab();
-			$n     = self::normalise( $r['suburb'] );
-			if ( isset( $vocab[ $n ] ) ) {
-				$r['suburb'] = $vocab[ $n ];
+			$names = array();
+			foreach ( self::split_values( $r['suburb'] ) as $one ) {
+				$n                                = self::normalise( $one );
+				$names[ '' !== $n ? $n : $one ] = $vocab[ $n ] ?? $one; // also removes duplicates
 			}
+			$r['suburb'] = implode( ', ', $names );
 		}
 
 		if ( '' === $r['suburb'] && ! $r['extras'] ) {
@@ -914,14 +930,14 @@ final class PH_Smart_Location {
 		$confident = ( $ranks[ $c['confidence'] ] ?? 0 ) >= $ranks[ $s['claude_min_confidence'] ];
 		$r['a']    = $confident ? 'used' : 'unsure';
 		$r['cf']   = substr( $c['confidence'], 0, 1 );
-		if ( '' === $c['suburb'] ) {
+		if ( ! $c['suburbs'] ) {
 			return '';
 		}
 		if ( ! $confident ) {
-			$r['notes'][] = sprintf( 'Claude suggested "%s" with low confidence (not used)', $c['suburb'] );
+			$r['notes'][] = sprintf( 'Claude suggested "%s" with low confidence (not used)', implode( ', ', $c['suburbs'] ) );
 			return '';
 		}
-		return $c['suburb'];
+		return implode( ', ', $c['suburbs'] );
 	}
 
 	/** Save values – only into empty fields, so manual edits are never overwritten. */
@@ -1134,12 +1150,12 @@ final class PH_Smart_Location {
 		$lines[] = 'OpenStreetMap areas at this location: ' . ( $areas ? implode( ', ', $areas ) : 'none' );
 		$tasks = array();
 		if ( $cands ) {
-			$tasks[] = "The agency's other properties at this postcode use these suburbs (number of properties): " . PHSL_Postcodes::format( $cands ) . ". Which one is this property in? Answer with one of those names exactly, or an empty suburb if you can't tell. OpenStreetMap data may be missing or wrong; use your own knowledge of the area.";
+			$tasks[] = "The agency's other properties at this postcode use these suburbs (number of properties): " . PHSL_Postcodes::format( $cands ) . ". Which of them describe this property? A property is often fairly described by more than one name – for example a local area and the better-known suburb it sits within, or two suburbs when it is on or near the boundary – so list EVERY one of these names that genuinely applies, most fitting first, rather than picking only one. Use the names exactly as given. Return an empty list if you can't tell. OpenStreetMap data may be missing or wrong; use your own knowledge of the area.";
 		} else {
-			$tasks[] = 'Identify the suburb: the locally recognised district or area name an estate agent would use for this address (for example "Edgbaston" or "Kings Norton"). Do not give the city, county, a building, a road or a housing development name. OpenStreetMap data may be missing or wrong; use your own knowledge of the area. If you are not reasonably sure, return an empty suburb.';
+			$tasks[] = 'Identify the suburb names for this address: the locally recognised district or area names an estate agent would use (for example "Edgbaston" or "Kings Norton"). A property is often fairly described by more than one name – for example a local area and the better-known suburb it sits within (such as "Jewellery Quarter" and "Birmingham City Centre"), or two suburbs when it is on or near the boundary – so list EVERY name that genuinely applies, most fitting first, up to 3, rather than only one. Do not give the city, county, a building, a road or a housing development name. OpenStreetMap data may be missing or wrong; use your own knowledge of the area. If you are not reasonably sure, return an empty list.';
 		}
 		$properties = array(
-			'suburb'     => $cands ? array( 'type' => 'string', 'enum' => array_merge( array_map( 'strval', array_keys( $cands ) ), array( '' ) ) ) : array( 'type' => 'string' ),
+			'suburbs'    => array( 'type' => 'array', 'items' => $cands ? array( 'type' => 'string', 'enum' => array_map( 'strval', array_keys( $cands ) ) ) : array( 'type' => 'string' ) ),
 			'confidence' => array( 'type' => 'string', 'enum' => array( 'high', 'medium', 'low' ) ),
 			'reason'     => array( 'type' => 'string' ),
 		);
@@ -1155,7 +1171,7 @@ final class PH_Smart_Location {
 					'schema' => array(
 						'type'                 => 'object',
 						'properties'           => $properties,
-						'required'             => array( 'suburb', 'confidence', 'reason' ),
+						'required'             => array( 'suburbs', 'confidence', 'reason' ),
 						'additionalProperties' => false,
 					),
 				),
@@ -1190,8 +1206,19 @@ final class PH_Smart_Location {
 		if ( ! is_array( $data ) ) {
 			return new WP_Error( 'claude_bad_output', 'unexpected answer (stop reason: ' . ( $response['stop_reason'] ?? '?' ) . ')' );
 		}
+		// Clean the list: trim, drop empties/duplicates and anything not offered, keep at most 3.
+		$suburbs = array();
+		foreach ( (array) ( $data['suburbs'] ?? array() ) as $one ) {
+			$one = trim( (string) $one );
+			$key = self::normalise( $one );
+			if ( '' === $key || isset( $suburbs[ $key ] ) || ( $cands && ! isset( $cands[ $one ] ) ) ) {
+				continue;
+			}
+			$suburbs[ $key ] = $one;
+		}
+		$suburbs = array_slice( array_values( $suburbs ), 0, 3 );
 		return array(
-			'suburb'        => trim( (string) ( $data['suburb'] ?? '' ) ),
+			'suburbs'       => $suburbs,
 			'confidence'    => in_array( $data['confidence'] ?? '', array( 'high', 'medium', 'low' ), true ) ? $data['confidence'] : 'low',
 			'reason'        => trim( (string) ( $data['reason'] ?? '' ) ),
 			'model'         => $response['model'] ?? $s['claude_model'],

@@ -1,4 +1,4 @@
-=== Property Hive Smart Location 1.6.1 ===
+=== Property Hive Smart Location 1.7 ===
 
 Fills a "smart suburb" field (meta key _smart_suburb by default) for each property, compares it with
 the manually entered suburb (_suburb by default), and can organise Location terms into a hierarchy.
@@ -17,6 +17,10 @@ How the smart suburb is found
 2. Postcode not in the list: OpenStreetMap reverse lookup (coordinates; address search if none),
    max 1 request/second - OSM's "suburb".
 3. If OSM has none, Claude is asked (answers below the minimum confidence are not used).
+   Claude is encouraged to give EVERY suburb name that genuinely applies - e.g. a local area and
+   the better-known suburb it sits in, or both suburbs on a boundary - most fitting first, up to 3
+   (when choosing from the postcode list's suburbs, any number of those). Several names are saved
+   comma-separated, like the manual field ("Jewellery Quarter, Birmingham City Centre").
 4. If the same suburb is already used on the site (in either field) with a particular spelling,
    that spelling is used ("King's Norton" -> "Kings Norton").
 Fields are only ever filled when EMPTY, so a smart suburb edited by hand is never overwritten.
@@ -25,7 +29,8 @@ Smart Location saved it) is shown with the source "Entered by hand". Optional ne
 filled from OSM in the same way.
 
 Comparison (Overview tab, Results tab filter, CSV export)
-  match          same, ignoring case/punctuation, or one of several manual values
+  match          same, ignoring case/punctuation; with several values on either side, any one
+                 in common (each smart value is compared and the best result is used)
   near match     small spelling slip (1 character; 2 for names of 10+ letters)
   partial match  one contains the other as whole words ("Harborne" / "Harborne Village")
   mismatch       both filled in and different
