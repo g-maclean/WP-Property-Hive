@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Property Hive Smart Location
  * Description: Fills a "smart suburb" field for each property using OpenStreetMap, with Claude AI as a fallback, compares it with the manually entered suburb, and can organise Location terms into a sensible hierarchy.
- * Version: 1.5
+ * Version: 1.6
  * Author: Property Hive
  * Requires at least: 5.6
  * Requires PHP: 7.2
@@ -19,8 +19,8 @@ require_once __DIR__ . '/includes/class-phsl-postcodes.php';
 
 final class PH_Smart_Location {
 
-	const VERSION       = '1.5';
-	const DB_VERSION    = '7';
+	const VERSION       = '1.6';
+	const DB_VERSION    = '8';
 	const OPTION        = 'phsl_settings';
 	const PAGE_SLUG     = 'ph-smart-location';
 	const NONCE         = 'phsl_nonce';
@@ -39,7 +39,8 @@ final class PH_Smart_Location {
 	 * _phsl:        flags: t (time), o (OSM: 1 suburb found / 0 none / x failed),
 	 *               a (Claude: used | unsure | error | nokey), src (postcode | postcode+osm |
 	 *               postcode+claude | postcode-top | osm:suburb | claude), pl (s = postcode sector),
-	 *               cf (Claude confidence), n (retry count),
+	 *               cf (Claude confidence), n (retry count), sv (the value Smart Location saved –
+	 *               if the field now holds something else it was edited by hand),
 	 *               v (pending suggestion: n => suburb, nb => neighbourhood, q => quarter)
 	 * Everything else goes to the log file.
 	 */
@@ -106,7 +107,7 @@ final class PH_Smart_Location {
 		$this->organiser = new PHSL_Organiser( $this );
 		$this->postcodes = new PHSL_Postcodes( $this );
 
-		foreach ( array( 'save_settings', 'apply', 'apply_all', 'retry', 'requeue', 'export', 'clear_log', 'download_log' ) as $action ) {
+		foreach ( array( 'save_settings', 'apply', 'apply_all', 'retry', 'requeue', 'reset_all', 'export', 'clear_log', 'download_log' ) as $action ) {
 			add_action( 'admin_post_phsl_' . $action, array( $this, 'handle_' . $action ) );
 		}
 	}
@@ -125,6 +126,8 @@ final class PH_Smart_Location {
 		if ( ! get_option( 'phsl_db_version' ) ) {
 			update_option( 'phsl_db_version', self::DB_VERSION, false );
 		}
+		// Every install / activation starts from scratch with a freshly built postcode list.
+		self::instance()->reset_all( 'plugin activated' );
 	}
 
 	public static function deactivate() {
@@ -164,6 +167,11 @@ final class PH_Smart_Location {
 		}
 		if ( $version && version_compare( $version, '7', '<' ) && ! get_option( PHSL_Postcodes::MAP ) ) {
 			$this->postcodes->generate(); // postcode list is now the first lookup
+		}
+		if ( $version && version_compare( $version, '8', '<' ) ) {
+			// Updating a plugin doesn't run its activation step, so start from scratch here too.
+			update_option( 'phsl_db_version', self::DB_VERSION, false );
+			$this->reset_all( 'plugin updated' );
 		}
 		if ( self::DB_VERSION !== $version ) {
 			update_option( 'phsl_db_version', self::DB_VERSION, false );
@@ -411,6 +419,7 @@ final class PH_Smart_Location {
 			'postcode-top'    => ucfirst( $list ) . ' (most common)',
 			'osm:suburb'      => 'OpenStreetMap',
 			'claude'          => 'Claude',
+			'manual'          => 'Entered by hand',
 		);
 		return $labels[ $src ] ?? (string) $src;
 	}
@@ -489,6 +498,66 @@ final class PH_Smart_Location {
 			}
 		}
 		return $n;
+	}
+
+	/**
+	 * Start again from scratch: clear the smart suburbs Smart Location wrote (keeping any edited by
+	 * hand since), reset every property's tracking state and rebuild the postcode list.
+	 *
+	 * @return array counts
+	 */
+	public function reset_all( $why ) {
+		global $wpdb;
+		$s       = self::settings();
+		$rows    = (array) $wpdb->get_results( $wpdb->prepare( "SELECT post_id, meta_value FROM {$wpdb->postmeta} WHERE meta_key = %s", self::META_STATUS ) );
+		$cleared = 0;
+		$kept    = 0;
+		foreach ( $rows as $row ) {
+			$pid = (int) $row->post_id;
+			if ( 'assigned' === $row->meta_value ) {
+				$state   = self::get_state( $pid );
+				$current = implode( ', ', self::meta_values( $pid, $s['smart_key'] ) );
+				if ( '' !== $current ) {
+					// Older saves didn't record the value, so those are cleared as plugin-written.
+					if ( ! isset( $state['sv'] ) || self::normalise( $state['sv'] ) === self::normalise( $current ) ) {
+						delete_post_meta( $pid, $s['smart_key'] );
+						$cleared++;
+					} else {
+						$kept++;
+					}
+				}
+			}
+			$this->clear_state( $pid );
+		}
+		$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->postmeta} WHERE meta_key = %s", self::META_STATE ) );
+		$this->vocab = null;
+		$info        = $this->postcodes->generate();
+		$out         = array( 'properties' => count( $rows ), 'cleared' => $cleared, 'kept' => $kept, 'postcodes' => $info['postcodes'] );
+		$this->log( 'info', sprintf( 'Started again from scratch (%s): tracking reset on %d properties; %d smart suburbs written by Smart Location cleared; %d edited by hand kept; postcode list rebuilt (%d postcodes).', $why, $out['properties'], $cleared, $kept, $out['postcodes'] ) );
+		return $out;
+	}
+
+	/**
+	 * Where the current smart suburb came from. "manual" when it was typed in by hand: changed
+	 * since Smart Location saved it, or present without Smart Location having saved anything.
+	 */
+	private static function current_source( $status, $state, $current ) {
+		if ( '' === $current ) {
+			return (string) ( $state['src'] ?? '' );
+		}
+		if ( 'assigned' === $status && isset( $state['sv'] ) && self::normalise( $state['sv'] ) !== self::normalise( $current ) ) {
+			return 'manual';
+		}
+		if ( 'assigned' !== $status && 'suggested' !== $status ) {
+			return 'manual';
+		}
+		return (string) ( $state['src'] ?? '' );
+	}
+
+	public function handle_reset_all() {
+		$this->check_admin_request( 'phsl_reset_all' );
+		$this->reset_all( 'started again by ' . wp_get_current_user()->user_login );
+		$this->redirect( 'run', 'reset_all' );
 	}
 
 	/* =====================================================================
@@ -577,7 +646,7 @@ final class PH_Smart_Location {
 					'smart'       => $smart,
 					'smart_state' => $state,
 					'comparison'  => self::compare( $manual, $smart, $checked ),
-					'src'         => (string) ( $st['src'] ?? '' ),
+					'src'         => 'suggested' === $state ? (string) ( $st['src'] ?? '' ) : self::current_source( $status, $st, $smart ),
 					'pl'          => (string) ( $st['pl'] ?? '' ),
 					'postcode_list' => PHSL_Postcodes::format( $this->postcodes->lookup( (string) get_post_meta( $pid, '_address_postcode', true ), $manual, (bool) $s['postcode_sector'] )['candidates'] ),
 					'confidence'  => $conf[ $st['cf'] ?? '' ] ?? '',
@@ -858,10 +927,11 @@ final class PH_Smart_Location {
 	}
 
 	/** Save values – only into empty fields, so manual edits are never overwritten. */
-	private function save_values( $pid, $r ) {
+	private function save_values( $pid, &$r ) {
 		$s = self::settings();
 		if ( '' !== $r['suburb'] && $this->smart_is_empty( $pid ) ) {
 			update_post_meta( $pid, $s['smart_key'], $r['suburb'] );
+			$r['saved']  = $r['suburb'];
 			$this->vocab = null;
 		}
 		foreach ( self::extra_fields() as $f => $key ) {
@@ -917,6 +987,7 @@ final class PH_Smart_Location {
 			'src' => $r['src'],
 			'cf'  => $r['cf'],
 			'pl'  => $r['pl'],
+			'sv'  => $r['saved'] ?? null,
 			'n'   => 'retry' === $r['status'] ? $r['n'] : null,
 		);
 		if ( 'suggested' === $r['status'] ) {
@@ -1301,6 +1372,7 @@ final class PH_Smart_Location {
 		);
 		$this->save_values( $pid, $r );
 		unset( $state['v'] );
+		$state['sv'] = $r['saved'] ?? null;
 		$this->set_state( $pid, 'assigned', $state );
 		$this->log( 'info', sprintf( 'Assigned (applied by %s): smart suburb "%s"', wp_get_current_user()->user_login, $r['suburb'] ), $pid );
 		return true;
@@ -1484,6 +1556,7 @@ final class PH_Smart_Location {
 			'applied'        => 'Suggestions applied.',
 			'retry'          => 'Property queued to be processed again.',
 			'requeued'       => 'Properties re-queued.',
+			'reset_all'      => 'Started again from scratch: smart suburbs written by Smart Location cleared (hand edits kept), tracking reset and postcode list rebuilt. Run “Process existing properties” to fill them in again.',
 			'log_cleared'    => 'Log files deleted.',
 			'postcodes_generated' => 'Postcode list generated from the manual suburbs.',
 			'postcodes_saved'     => 'Postcode saved.',
@@ -1600,9 +1673,11 @@ final class PH_Smart_Location {
 				<?php
 				$this->post_button( 'phsl_requeue', 'Retry “nothing found” where Claude wasn’t tried', array( 'which' => 'not_found' ) );
 				$this->post_button( 'phsl_requeue', 'Retry errors', array( 'which' => 'errors' ) );
-				$this->post_button( 'phsl_requeue', 'Re-queue everything', array( 'which' => 'all' ), 'button button-link-delete', 'Forget all previous attempts and suggestions? Properties without a smart suburb will be looked up again (Claude calls cost a little). Saved smart suburbs are kept.' );
+				$this->post_button( 'phsl_requeue', 'Re-queue everything', array( 'which' => 'all' ), 'button', 'Forget all previous attempts and suggestions? Properties without a smart suburb will be looked up again (Claude calls cost a little). Saved smart suburbs are kept.' );
+				$this->post_button( 'phsl_reset_all', 'Start again from scratch', array(), 'button button-link-delete', 'Clear every smart suburb Smart Location saved (ones edited by hand are kept), reset all tracking and rebuild the postcode list? Then run “Process existing properties” to fill them in again.' );
 				?>
 			</p>
+			<p class="description"><strong>Start again from scratch</strong> also happens automatically when the plugin is installed, activated or updated.</p>
 			<p class="description">To redo a property’s smart suburb, clear its <code><?php echo esc_html( $s['smart_key'] ); ?></code> field and click Retry on the Results tab.</p>
 		</div>
 
@@ -1703,7 +1778,8 @@ final class PH_Smart_Location {
 						<?php if ( ! empty( $st['t'] ) ) : ?><br><small><?php echo esc_html( wp_date( 'j M Y H:i', $st['t'] ) ); ?></small><?php endif; ?></td>
 					<td><?php echo $manual ? esc_html( implode( ', ', $manual ) ) : '–'; ?></td>
 					<td><?php echo '' !== $smart ? esc_html( $smart ) : '–'; ?>
-						<?php if ( ! empty( $st['src'] ) ) : ?><br><small><?php echo esc_html( self::source_label( $st['src'], $st['pl'] ?? '' ) . ( false !== strpos( $st['src'], 'claude' ) && ! empty( $st['cf'] ) ? ', ' . ( $conf[ $st['cf'] ] ?? '' ) . ' confidence' : '' ) ); ?><?php echo $suggested ? ' · <strong>suggested</strong>' : ''; ?></small><?php endif; ?></td>
+						<?php $src = $suggested ? (string) ( $st['src'] ?? '' ) : self::current_source( (string) $row->status, $st, $smart ); ?>
+						<?php if ( '' !== $src ) : ?><br><small><?php echo esc_html( self::source_label( $src, $st['pl'] ?? '' ) . ( false !== strpos( $src, 'claude' ) && ! empty( $st['cf'] ) ? ', ' . ( $conf[ $st['cf'] ] ?? '' ) . ' confidence' : '' ) ); ?><?php echo $suggested ? ' · <strong>suggested</strong>' : ''; ?></small><?php endif; ?></td>
 					<td><span class="phsl-badge phsl-cmp-<?php echo esc_attr( str_replace( ' ', '-', $cmp ) ); ?>"><?php echo esc_html( $cmp ); ?></span></td>
 					<?php foreach ( $extras as $f => $key ) : ?>
 						<td><?php echo esc_html( $pending ? ( $v[ 'neighbourhood' === $f ? 'nb' : 'q' ] ?? '–' ) : ( implode( ', ', self::meta_values( $pid, $key ) ) ?: '–' ) ); ?></td>

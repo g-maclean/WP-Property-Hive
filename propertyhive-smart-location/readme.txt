@@ -1,4 +1,4 @@
-=== Property Hive Smart Location 1.5 ===
+=== Property Hive Smart Location 1.6 ===
 
 Fills a "smart suburb" field (meta key _smart_suburb by default) for each property, compares it with
 the manually entered suburb (_suburb by default), and can organise Location terms into a hierarchy.
@@ -20,7 +20,8 @@ How the smart suburb is found
 4. If the same suburb is already used on the site (in either field) with a particular spelling,
    that spelling is used ("King's Norton" -> "Kings Norton").
 Fields are only ever filled when EMPTY, so a smart suburb edited by hand is never overwritten.
-To redo one, clear the field and click Retry. Optional neighbourhood / quarter custom fields are
+To redo one, clear the field and click Retry. A smart suburb typed in by hand (or changed after
+Smart Location saved it) is shown with the source "Entered by hand". Optional neighbourhood / quarter custom fields are
 filled from OSM in the same way.
 
 Comparison (Overview tab, Results tab filter, CSV export)
@@ -55,6 +56,16 @@ Review the proposed tree and moves, apply selected, undo the last apply. Never r
 
 Post meta: _phsl_status (one word) and _phsl (small flags array). Detail goes to monthly log files
 in wp-content/uploads/ph-smart-location-logs/ (protected), viewable on the Log tab.
+
+Starting again from scratch
+Happens automatically on install / activation and when updating to 1.6, and from the Overview tab
+("Start again from scratch"):
+- smart suburbs Smart Location wrote are cleared; ones edited by hand since are kept (from 1.6 the
+  saved value is recorded so this can be told apart - values saved by 1.5 and earlier are treated
+  as plugin-written), and values on properties Smart Location never assigned are kept
+- every property's tracking state is reset
+- the postcode list is rebuilt from the manual suburbs
+Then run "Process existing properties" to fill them in again.
 
 Upgrading to 1.5: the postcode list is generated automatically the first time.
 
