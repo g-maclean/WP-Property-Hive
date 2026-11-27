@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Property Hive Smart Location
  * Description: Fills a "smart suburb" field for each property using OpenStreetMap, with Claude AI as a fallback, compares it with the manually entered suburb, and can organise Location terms into a sensible hierarchy.
- * Version: 1.7
+ * Version: 1.8
  * Author: Property Hive
  * Requires at least: 5.6
  * Requires PHP: 7.2
@@ -19,8 +19,8 @@ require_once __DIR__ . '/includes/class-phsl-postcodes.php';
 
 final class PH_Smart_Location {
 
-	const VERSION       = '1.7';
-	const DB_VERSION    = '8';
+	const VERSION       = '1.8';
+	const DB_VERSION    = '9';
 	const OPTION        = 'phsl_settings';
 	const PAGE_SLUG     = 'ph-smart-location';
 	const NONCE         = 'phsl_nonce';
@@ -38,7 +38,8 @@ final class PH_Smart_Location {
 	 * _phsl_status: assigned | suggested | not_found | error | skipped | retry
 	 * _phsl:        flags: t (time), o (OSM: 1 suburb found / 0 none / x failed),
 	 *               a (Claude: used | unsure | error | nokey), src (postcode | postcode+osm |
-	 *               postcode+claude | postcode-top | osm:suburb | claude), pl (s = postcode sector),
+	 *               postcode+claude | postcode-top | osm:suburb | claude), pl (postcode list level
+	 *               matched: f full postcode / s sector / d district),
 	 *               cf (Claude confidence), n (retry count), sv (the value Smart Location saved –
 	 *               if the field now holds something else it was edited by hand),
 	 *               v (pending suggestion: n => suburb, nb => neighbourhood, q => quarter)
@@ -166,6 +167,10 @@ final class PH_Smart_Location {
 		if ( $version && version_compare( $version, '7', '<' ) && ! get_option( PHSL_Postcodes::MAP ) ) {
 			$this->postcodes->generate(); // postcode list is now the first lookup
 		}
+		if ( $version && version_compare( $version, '9', '<' ) && version_compare( $version, '8', '>=' ) ) {
+			// The generated postcode list is now built at district level ("B13"), not full postcodes.
+			$this->postcodes->generate();
+		}
 		if ( $version && version_compare( $version, '8', '<' ) ) {
 			// One-time reset when updating to 1.6: re-run everything with the postcode list.
 			update_option( 'phsl_db_version', self::DB_VERSION, false );
@@ -197,7 +202,6 @@ final class PH_Smart_Location {
 			'smart_key'             => '_smart_suburb',
 			'manual_key'            => '_suburb',
 			'postcode_enabled'      => 1,
-			'postcode_sector'       => 1,
 			'neighbourhood_enabled' => 0,
 			'neighbourhood_key'     => '_neighbourhood',
 			'quarter_enabled'       => 0,
@@ -276,7 +280,6 @@ final class PH_Smart_Location {
 			'smart_key'             => self::sanitize_meta_key( $p['smart_key'] ?? '_smart_suburb', '_smart_suburb' ),
 			'manual_key'            => self::sanitize_meta_key( $p['manual_key'] ?? '_suburb', '_suburb' ),
 			'postcode_enabled'      => empty( $p['postcode_enabled'] ) ? 0 : 1,
-			'postcode_sector'       => empty( $p['postcode_sector'] ) ? 0 : 1,
 			'neighbourhood_enabled' => empty( $p['neighbourhood_enabled'] ) ? 0 : 1,
 			'neighbourhood_key'     => self::sanitize_meta_key( $p['neighbourhood_key'] ?? '_neighbourhood', '_neighbourhood' ),
 			'quarter_enabled'       => empty( $p['quarter_enabled'] ) ? 0 : 1,
@@ -423,7 +426,8 @@ final class PH_Smart_Location {
 
 	/** Human-readable label for a smart suburb source. */
 	public static function source_label( $src, $level = '' ) {
-		$list   = 's' === $level ? 'postcode sector list' : 'postcode list';
+		$where  = array( 'f' => ' (full postcode)', 's' => ' (sector)', 'd' => ' (district)' );
+		$list   = 'postcode list' . ( $where[ $level ] ?? '' );
 		$labels = array(
 			'postcode'        => ucfirst( $list ),
 			'postcode+osm'    => ucfirst( $list ) . ' + OpenStreetMap',
@@ -660,7 +664,7 @@ final class PH_Smart_Location {
 					'comparison'  => self::compare( $manual, $smart, $checked ),
 					'src'         => 'suggested' === $state ? (string) ( $st['src'] ?? '' ) : self::current_source( $status, $st, $smart ),
 					'pl'          => (string) ( $st['pl'] ?? '' ),
-					'postcode_list' => PHSL_Postcodes::format( $this->postcodes->lookup( (string) get_post_meta( $pid, '_address_postcode', true ), $manual, (bool) $s['postcode_sector'] )['candidates'] ),
+					'postcode_list' => PHSL_Postcodes::format( $this->postcodes->lookup( (string) get_post_meta( $pid, '_address_postcode', true ), $manual )['candidates'] ),
 					'confidence'  => $conf[ $st['cf'] ?? '' ] ?? '',
 					'status'      => $status,
 				);
@@ -780,9 +784,9 @@ final class PH_Smart_Location {
 		$pl    = '';
 		if ( $need_suburb && $s['postcode_enabled'] ) {
 			// Leave this property's own manual suburb out of the counts, so it isn't matched against itself.
-			$lookup = $this->postcodes->lookup( $postcode, self::meta_values( $pid, $s['manual_key'] ), (bool) $s['postcode_sector'] );
+			$lookup = $this->postcodes->lookup( $postcode, self::meta_values( $pid, $s['manual_key'] ) );
 			$cands  = $lookup['candidates'];
-			$pl     = 'sector' === $lookup['level'] ? 's' : '';
+			$pl     = array( 'full' => 'f', 'sector' => 's', 'district' => 'd' )[ $lookup['level'] ] ?? '';
 			if ( $cands ) {
 				$r['context']['postcode'] = array( 'matched' => $lookup['key'], 'level' => $lookup['level'], 'suburbs' => $cands ) + ( empty( $lookup['override'] ) ? array() : array( 'your_edit' => true ) );
 			}
@@ -855,7 +859,7 @@ final class PH_Smart_Location {
 				if ( '' === $r['suburb'] ) {
 					$r['suburb']  = (string) key( $cands );
 					$r['src']     = 'postcode-top';
-					$r['notes'][] = 'most common suburb for the postcode (' . PHSL_Postcodes::format( $cands ) . ')';
+					$r['notes'][] = 'most common suburb for ' . $lookup['key'] . ' (' . PHSL_Postcodes::format( $cands ) . ')';
 				}
 				$r['pl'] = $pl;
 			} else {
@@ -1639,7 +1643,7 @@ final class PH_Smart_Location {
 					<span class="phsl-badge phsl-suggested">Suggest only</span>: nothing is saved; review suggestions on the Results tab.
 				<?php endif; ?>
 			</p>
-			<p><strong>Smart suburb:</strong> <?php echo $s['postcode_enabled'] ? 'postcode list (' . esc_html( number_format_i18n( count( (array) get_option( PHSL_Postcodes::MAP, array() ) ) ) ) . ' postcodes), then ' : ''; ?>OpenStreetMap suburb
+			<p><strong>Smart suburb:</strong> <?php echo $s['postcode_enabled'] ? 'postcode list (' . esc_html( number_format_i18n( count( (array) get_option( PHSL_Postcodes::MAP, array() ) ) ) ) . ' districts, plus your own entries), then ' : ''; ?>OpenStreetMap suburb
 				<?php if ( self::claude_enabled() ) : ?>, then <strong><?php echo esc_html( self::$models[ $s['claude_model'] ] ); ?></strong>.
 				<?php elseif ( $s['use_claude'] ) : ?>. <span class="phsl-warn">Claude is enabled but there is no API key.</span>
 				<?php else : ?>. Claude is off.<?php endif; ?>
@@ -1951,9 +1955,8 @@ final class PH_Smart_Location {
 				<tr>
 					<th scope="row">Postcode lookup</th>
 					<td>
-						<label class="phsl-block"><input type="checkbox" name="postcode_enabled" value="1" <?php checked( $s['postcode_enabled'] ); ?>> Check the postcode list first (built from the manual suburbs – see the Postcodes tab)</label>
-						<label class="phsl-block"><input type="checkbox" name="postcode_sector" value="1" <?php checked( $s['postcode_sector'] ); ?>> If the full postcode isn’t in the list, use its postcode sector (e.g. “B30 2”)</label>
-						<p class="description">One suburb for the postcode: used straight away. Several: OpenStreetMap picks, then Claude, otherwise the most common. None: OpenStreetMap, then Claude.</p>
+						<label class="phsl-block"><input type="checkbox" name="postcode_enabled" value="1" <?php checked( $s['postcode_enabled'] ); ?>> Check the postcode list first (see the Postcodes tab)</label>
+						<p class="description">Generated by postcode district (“B13”) from the manual suburbs; your own entries can be a district, a sector (“B13 3”) or a full postcode, and the most specific entry available is used. One suburb: used straight away. Several: OpenStreetMap picks, then Claude, otherwise the most common. None: OpenStreetMap, then Claude.</p>
 					</td>
 				</tr>
 			</table>

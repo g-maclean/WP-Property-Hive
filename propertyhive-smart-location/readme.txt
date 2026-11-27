@@ -1,14 +1,17 @@
-=== Property Hive Smart Location 1.7 ===
+=== Property Hive Smart Location 1.8 ===
 
 Fills a "smart suburb" field (meta key _smart_suburb by default) for each property, compares it with
 the manually entered suburb (_suburb by default), and can organise Location terms into a hierarchy.
 It never touches the Location taxonomy assignments or the manual suburb field.
 
 How the smart suburb is found
-1. Postcode list (first). Built from the manual suburb field: for each full postcode, the suburbs
-   used by properties there and how many (one postcode can have several). See the Postcodes tab:
-   generate / rebuild, search, and your own edits (kept separately, survive a rebuild; "-" ignores
-   a postcode). If the full postcode isn't listed, its sector (e.g. "B30 2") is used (optional).
+1. Postcode list (first). Generated from the manual suburb field by postcode DISTRICT (the first
+   part, e.g. "B13"): the suburbs used by properties in each district and how many (one district
+   can have several). On the Postcodes tab you can add your own entries at any precision - a
+   district ("B13"), a sector ("B13 3") or a full postcode ("B13 3AB"); "-" ignores a postcode.
+   Your entries are kept separately, survive a rebuild, and beat a generated entry for the same
+   district. For each property the MOST SPECIFIC entry available is used: full postcode, then
+   sector, then district.
    - one suburb: used, no other lookups
    - several: OpenStreetMap's suburb picks one of them; otherwise Claude chooses (restricted to
      those names); otherwise the most common is used (marked as such)
@@ -41,8 +44,8 @@ Comparison (Overview tab, Results tab filter, CSV export)
 In Suggest mode the pending suggestion is compared (marked "suggested" in the export).
 
 CSV export columns: Property ID, Property, Postcode, Manual suburb, Smart suburb, Comparison,
-Smart suburb status (saved/suggested), Smart suburb source (postcode list / sector list, + OSM /
-+ Claude / most common, OpenStreetMap, Claude), Claude confidence, Lookup status, the postcode
+Smart suburb status (saved/suggested), Smart suburb source (postcode list - full postcode / sector /
+district - + OSM / + Claude / most common, OpenStreetMap, Claude), Claude confidence, Lookup status, the postcode
 list's suburbs for that postcode (excluding the property itself),
 plus any enabled neighbourhood/quarter fields. "Export all" or one comparison value at a time.
 
@@ -71,6 +74,9 @@ run again at any time with "Start again from scratch" on the Overview tab:
 - every property's tracking state is reset
 - the postcode list is rebuilt from the manual suburbs
 Then run "Process existing properties" to fill them in again.
+
+Upgrading to 1.8: the generated postcode list is rebuilt once at district level (your own entries
+are kept; full-postcode entries still match as the most specific level).
 
 Upgrading to 1.5: the postcode list is generated automatically the first time.
 
